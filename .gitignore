@@ -15,6 +15,9 @@ venv/
 # Docker
 .env
 
+# MuleSoft binaries
+*.zip
+
 # OS
 .DS_Store
 Thumbs.db
