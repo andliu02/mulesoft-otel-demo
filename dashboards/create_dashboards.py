@@ -15,6 +15,11 @@ Usage:
     python create_dashboards.py --kibana-url <URL> --api-key <KEY>
     # or via env vars:
     KIBANA_URL=https://... ELASTIC_API_KEY=... python create_dashboards.py
+
+Field naming in Elastic OTel indices:
+    Metric values:  metrics.<name>    e.g. metrics.mule.flow.executions
+    Attributes:     attributes.<name> e.g. attributes.mule.flow.name
+    Resource attrs: resource.attributes.<name> (service.name is top-level)
 """
 
 import argparse
@@ -26,8 +31,17 @@ import requests as http_requests
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 METRICS_INDEX = "metrics-*"
-TRACES_INDEX = "traces-apm*"
+TRACES_INDEX = "traces-*"
 LOGS_INDEX = "logs-*"
+
+# OTel → Elastic field path helpers
+def M(name):
+    """Metric value field path."""
+    return f"metrics.{name}"
+
+def A(name):
+    """Attribute field path."""
+    return f"attributes.{name}"
 
 
 # ─── Kibana API client ──────────────────────────────────────────────────────
@@ -64,10 +78,8 @@ class KibanaClient:
         if references:
             body["references"] = references
 
-        # Try create first, then update if exists
         resp = self._request("POST", f"/api/saved_objects/{obj_type}/{obj_id}?overwrite=true", body)
         if resp.status_code == 409:
-            # Already exists, update it
             resp = self._request("PUT", f"/api/saved_objects/{obj_type}/{obj_id}", body)
 
         if resp.status_code in (200, 201):
@@ -80,7 +92,7 @@ class KibanaClient:
 
 # ─── Visualization builders ─────────────────────────────────────────────────
 
-def lens_metric(client, viz_id, title, metric_name, agg="sum",
+def lens_metric(client, viz_id, title, metric_field, agg="sum",
                 data_view_id="metrics-otel", subtitle=""):
     """Single metric number visualization."""
     attrs = {
@@ -99,7 +111,7 @@ def lens_metric(client, viz_id, title, metric_name, agg="sum",
                 "columns": {"metric_col": {
                     "dataType": "number", "isBucketed": False, "label": title,
                     "operationType": agg,
-                    **({"sourceField": metric_name} if agg != "count" else {}),
+                    **({"sourceField": metric_field} if agg != "count" else {}),
                     "params": {},
                 }},
                 "incompleteColumns": {},
@@ -110,7 +122,7 @@ def lens_metric(client, viz_id, title, metric_name, agg="sum",
     return client.upsert_saved_object("lens", viz_id, attrs, refs)
 
 
-def lens_xy(client, viz_id, title, metric_name, agg="sum", chart_type="bar_stacked",
+def lens_xy(client, viz_id, title, metric_field, agg="sum", chart_type="bar_stacked",
             breakdown_field=None, data_view_id="metrics-otel", value_label=None):
     """XY chart (bar/line/area) visualization."""
     columns = {
@@ -122,7 +134,7 @@ def lens_xy(client, viz_id, title, metric_name, agg="sum", chart_type="bar_stack
         "y_col": {
             "dataType": "number", "isBucketed": False,
             "label": value_label or title, "operationType": agg,
-            **({"sourceField": metric_name} if agg != "count" else {}),
+            **({"sourceField": metric_field} if agg != "count" else {}),
             "params": {},
         },
     }
@@ -163,7 +175,7 @@ def lens_xy(client, viz_id, title, metric_name, agg="sum", chart_type="bar_stack
     return client.upsert_saved_object("lens", viz_id, attrs, refs)
 
 
-def lens_pie(client, viz_id, title, metric_name, slice_field, agg="sum",
+def lens_pie(client, viz_id, title, metric_field, slice_field, agg="sum",
              data_view_id="metrics-otel"):
     """Pie/donut chart visualization."""
     columns = {
@@ -175,7 +187,7 @@ def lens_pie(client, viz_id, title, metric_name, slice_field, agg="sum",
         "metric_col": {
             "dataType": "number", "isBucketed": False, "label": title,
             "operationType": agg,
-            **({"sourceField": metric_name} if agg != "count" else {}),
+            **({"sourceField": metric_field} if agg != "count" else {}),
             "params": {},
         },
     }
@@ -307,43 +319,44 @@ def build_dashboard_1(client):
     print("  Creating visualizations...")
 
     # Row 1: Metric tiles
-    lens_metric(client, f"{p}flow-exec", "Flow Executions", "mule.flow.executions", subtitle="Total")
-    lens_metric(client, f"{p}flow-errors", "Flow Errors", "mule.flow.errors", subtitle="Total")
-    lens_metric(client, f"{p}msgs-processed", "Messages Processed", "mule.messages.processed", subtitle="Total")
-    lens_metric(client, f"{p}active-flows", "Active Flows", "mule.flows.active", agg="max", subtitle="Current")
+    lens_metric(client, f"{p}flow-exec", "Flow Executions", M("mule.flow.executions"), subtitle="Total")
+    lens_metric(client, f"{p}flow-errors", "Flow Errors", M("mule.flow.errors"), subtitle="Total")
+    lens_metric(client, f"{p}msgs-processed", "Messages Processed", M("mule.messages.processed"), subtitle="Total")
+    lens_metric(client, f"{p}active-flows", "Active Flows", M("mule.flows.active"), agg="max", subtitle="Current")
 
-    # Row 2: Flow executions over time
+    # Row 2: Flow executions over time by flow name
     lens_xy(client, f"{p}flow-exec-time", "Flow Executions Over Time",
-            "mule.flow.executions", breakdown_field="mule.flow.name")
+            M("mule.flow.executions"), breakdown_field=A("mule.flow.name"))
 
-    # Row 3: Duration & latency
-    lens_xy(client, f"{p}flow-duration", "Flow Duration (ms)",
-            "mule.flow.duration", agg="average", chart_type="line",
-            breakdown_field="mule.flow.name", value_label="Avg Duration (ms)")
-    lens_xy(client, f"{p}backend-latency", "Backend Latency (ms)",
-            "mule.backend.latency", agg="average", chart_type="bar",
-            breakdown_field="mule.backend", value_label="Avg Latency (ms)")
-
-    # Row 4: HTTP by backend + errors
+    # Row 3: HTTP requests over time + by backend
+    lens_xy(client, f"{p}http-over-time", "HTTP Connector Requests Over Time",
+            M("mule.http.requests"), chart_type="line",
+            breakdown_field=A("mule.backend"), value_label="Requests")
     lens_pie(client, f"{p}http-by-backend", "HTTP Requests by Backend",
-             "mule.http.requests", "mule.backend")
+             M("mule.http.requests"), A("mule.backend"))
+
+    # Row 4: Messages processed + flow errors over time
+    lens_xy(client, f"{p}msgs-over-time", "Messages Processed Over Time",
+            M("mule.messages.processed"), chart_type="area",
+            breakdown_field=A("mule.flow.name"), value_label="Messages")
     lens_xy(client, f"{p}flow-errors-time", "Flow Errors Over Time",
-            "mule.flow.errors", chart_type="bar_stacked", breakdown_field="mule.flow.name")
+            M("mule.flow.errors"), chart_type="bar_stacked",
+            breakdown_field=A("mule.flow.name"))
 
     print("  Creating dashboard...")
     create_dashboard(client, "fnb-dashboard-mulesoft-metrics",
         "[FNB] Phase 1: MuleSoft Integration — Runtime Metrics",
-        "MuleSoft Anypoint Runtime health: flow executions, errors, durations, and backend connectivity.",
+        "MuleSoft Anypoint Runtime health: flow executions, errors, HTTP connector activity, and backend connectivity.",
         [
             (f"{p}flow-exec",       "lens", 0,  0, 12, 8),
             (f"{p}flow-errors",     "lens", 12, 0, 12, 8),
             (f"{p}msgs-processed",  "lens", 24, 0, 12, 8),
             (f"{p}active-flows",    "lens", 36, 0, 12, 8),
             (f"{p}flow-exec-time",  "lens", 0,  8, 48, 12),
-            (f"{p}flow-duration",   "lens", 0,  20, 24, 14),
-            (f"{p}backend-latency", "lens", 24, 20, 24, 14),
-            (f"{p}http-by-backend", "lens", 0,  34, 20, 14),
-            (f"{p}flow-errors-time","lens", 20, 34, 28, 14),
+            (f"{p}http-over-time",  "lens", 0,  20, 28, 14),
+            (f"{p}http-by-backend", "lens", 28, 20, 20, 14),
+            (f"{p}msgs-over-time",  "lens", 0,  34, 24, 14),
+            (f"{p}flow-errors-time","lens", 24, 34, 24, 14),
         ])
 
 
@@ -354,34 +367,33 @@ def build_dashboard_2(client):
     print("  Creating visualizations...")
 
     # Row 1: Key counters
-    lens_metric(client, f"{p}portal-reqs", "Portal Requests", "portal.requests.total", subtitle="Total")
-    lens_metric(client, f"{p}portal-errs", "Portal Errors", "portal.errors.total", subtitle="Total")
-    lens_metric(client, f"{p}fraud-checks", "Fraud Checks", "fraud.checks.total", subtitle="Total")
-    lens_metric(client, f"{p}aml-checks", "AML Screenings", "aml.checks.total", subtitle="Total")
+    lens_metric(client, f"{p}portal-reqs", "Portal Requests", M("portal.requests.total"), subtitle="Total")
+    lens_metric(client, f"{p}portal-errs", "Portal Errors", M("portal.errors.total"), subtitle="Total")
+    lens_metric(client, f"{p}fraud-checks", "Fraud Checks", M("fraud.checks.total"), subtitle="Total")
+    lens_metric(client, f"{p}aml-checks", "AML Screenings", M("aml.checks.total"), subtitle="Total")
 
-    # Row 2: Transaction volume
+    # Row 2: Transaction volume over time by operation
     lens_xy(client, f"{p}txn-volume", "Transaction Volume Over Time",
-            "portal.requests.total", breakdown_field="portal.operation")
+            M("portal.requests.total"), breakdown_field=A("portal.operation"))
 
-    # Row 3: Latency + fraud scores
-    lens_xy(client, f"{p}mule-latency", "MuleSoft Call Latency by Operation",
-            "portal.mulesoft.latency", agg="average", chart_type="line",
-            breakdown_field="mulesoft.operation", value_label="Avg Latency (ms)")
-    lens_xy(client, f"{p}fraud-scores", "Fraud Score Distribution",
-            "fraud.score", agg="average", chart_type="bar",
-            breakdown_field="fraud.risk_level", value_label="Avg Score")
+    # Row 3: MuleSoft calls + portal errors
+    lens_xy(client, f"{p}mule-calls", "MuleSoft Calls by Operation",
+            M("portal.mulesoft.calls"), chart_type="bar",
+            breakdown_field=A("mulesoft.operation"), value_label="Calls")
+    lens_xy(client, f"{p}mule-errors", "MuleSoft Call Errors",
+            M("portal.mulesoft.errors"), chart_type="bar_stacked",
+            breakdown_field=A("mulesoft.operation"), value_label="Errors")
 
-    # Row 4: Fraud by country + AML results + portal ops
-    lens_pie(client, f"{p}fraud-country", "Fraud Flags by Country",
-             "fraud.flags.total", "fraud.destination_country")
-    lens_pie(client, f"{p}aml-results", "AML Screening Results",
-             "aml.checks.total", "aml.status")
+    # Row 4: Fraud by risk level + AML results + portal ops breakdown
+    lens_pie(client, f"{p}fraud-risk", "Fraud Checks by Risk Level",
+             M("fraud.checks.total"), A("fraud.risk_level"))
     lens_pie(client, f"{p}portal-ops", "Portal Requests by Operation",
-             "portal.requests.total", "portal.operation")
+             M("portal.requests.total"), A("portal.operation"))
 
     # Row 5: Portal errors over time
     lens_xy(client, f"{p}portal-errors-time", "Portal Errors Over Time",
-            "portal.errors.total", chart_type="bar_stacked", breakdown_field="portal.operation")
+            M("portal.errors.total"), chart_type="bar_stacked",
+            breakdown_field=A("portal.operation"))
 
     print("  Creating dashboard...")
     create_dashboard(client, "fnb-dashboard-payment-ops",
@@ -393,11 +405,10 @@ def build_dashboard_2(client):
             (f"{p}fraud-checks",        "lens", 24, 0, 12, 8),
             (f"{p}aml-checks",          "lens", 36, 0, 12, 8),
             (f"{p}txn-volume",          "lens", 0,  8, 48, 12),
-            (f"{p}mule-latency",        "lens", 0,  20, 24, 14),
-            (f"{p}fraud-scores",        "lens", 24, 20, 24, 14),
-            (f"{p}fraud-country",       "lens", 0,  34, 16, 14),
-            (f"{p}aml-results",         "lens", 16, 34, 16, 14),
-            (f"{p}portal-ops",          "lens", 32, 34, 16, 14),
+            (f"{p}mule-calls",          "lens", 0,  20, 24, 14),
+            (f"{p}mule-errors",         "lens", 24, 20, 24, 14),
+            (f"{p}fraud-risk",          "lens", 0,  34, 24, 14),
+            (f"{p}portal-ops",          "lens", 24, 34, 24, 14),
             (f"{p}portal-errors-time",  "lens", 0,  48, 48, 12),
         ])
 
@@ -409,28 +420,30 @@ def build_dashboard_3(client):
     print("  Creating visualizations...")
 
     # Row 1: Key DB metrics
-    lens_metric(client, f"{p}total-queries", "Total DB Queries", "db.queries.total", subtitle="Count")
-    lens_metric(client, f"{p}slow-queries", "Slow Queries", "db.slow_queries.total", subtitle="Count")
-    lens_metric(client, f"{p}active-sessions", "Active Sessions", "db.sessions.active", agg="max", subtitle="Current")
-    lens_metric(client, f"{p}debits", "Accounts Debited", "banking.accounts.debited", subtitle="Count")
+    lens_metric(client, f"{p}total-queries", "Total DB Queries", M("db.queries.total"), subtitle="Count")
+    lens_metric(client, f"{p}slow-queries", "Slow Queries", M("db.slow_queries.total"), subtitle="Count")
+    lens_metric(client, f"{p}active-sessions", "Active DB Sessions", M("db.sessions.active"), agg="max", subtitle="Current")
+    lens_metric(client, f"{p}debits", "Accounts Debited", M("banking.accounts.debited"), subtitle="Count")
 
-    # Row 2: Query duration over time (the smoking gun)
-    lens_xy(client, f"{p}query-duration", "DB Query Duration Over Time (Smoking Gun)",
-            "db.query.duration", agg="average", chart_type="line",
-            value_label="Avg Duration (ms)")
+    # Row 2: DB queries over time (normal vs slow)
+    lens_xy(client, f"{p}queries-over-time", "DB Queries Over Time",
+            M("db.queries.total"), chart_type="bar",
+            breakdown_field=A("db.operation"), value_label="Queries")
 
-    # Row 3: Slow queries + queries by table
-    lens_xy(client, f"{p}slow-over-time", "Slow Queries Over Time",
-            "db.slow_queries.total", chart_type="bar", breakdown_field="db.sql.table")
+    # Row 3: Slow queries over time + queries by table
+    lens_xy(client, f"{p}slow-over-time", "Slow Queries Over Time (Smoking Gun)",
+            M("db.slow_queries.total"), chart_type="bar",
+            breakdown_field=A("db.sql.table"), value_label="Slow Queries")
     lens_pie(client, f"{p}queries-by-table", "Queries by Table",
-             "db.queries.total", "db.sql.table")
+             M("db.queries.total"), A("db.sql.table"))
 
-    # Row 4: Balance checks + transaction amounts
+    # Row 4: Balance checks + active sessions over time
     lens_xy(client, f"{p}balance-checks", "Balance Checks by Account Type",
-            "banking.balance.checks", chart_type="bar_stacked", breakdown_field="account.type")
-    lens_xy(client, f"{p}txn-amounts", "Transaction Amounts",
-            "banking.transaction.amount", agg="sum", chart_type="area",
-            value_label="Total Amount (USD)")
+            M("banking.balance.checks"), chart_type="bar_stacked",
+            breakdown_field=A("account.type"))
+    lens_xy(client, f"{p}sessions-over-time", "Active DB Sessions Over Time",
+            M("db.sessions.active"), agg="max", chart_type="line",
+            value_label="Active Sessions")
 
     # Row 5: Slow query log
     lens_table(client, f"{p}slow-log", "Slow Query Log",
@@ -441,18 +454,18 @@ def build_dashboard_3(client):
     print("  Creating dashboard...")
     create_dashboard(client, "fnb-dashboard-core-banking-db",
         "[FNB] Phase 1: Core Banking — Database Performance",
-        "Core banking DB health: query performance, slow query detection (the demo's smoking gun), and transaction volumes.",
+        "Core banking DB health: query volumes, slow query detection (the demo's smoking gun), and transaction activity.",
         [
-            (f"{p}total-queries",    "lens", 0,  0, 12, 8),
-            (f"{p}slow-queries",     "lens", 12, 0, 12, 8),
-            (f"{p}active-sessions",  "lens", 24, 0, 12, 8),
-            (f"{p}debits",           "lens", 36, 0, 12, 8),
-            (f"{p}query-duration",   "lens", 0,  8, 48, 14),
-            (f"{p}slow-over-time",   "lens", 0,  22, 28, 14),
-            (f"{p}queries-by-table", "lens", 28, 22, 20, 14),
-            (f"{p}balance-checks",   "lens", 0,  36, 24, 12),
-            (f"{p}txn-amounts",      "lens", 24, 36, 24, 12),
-            (f"{p}slow-log",         "lens", 0,  48, 48, 14),
+            (f"{p}total-queries",     "lens", 0,  0, 12, 8),
+            (f"{p}slow-queries",      "lens", 12, 0, 12, 8),
+            (f"{p}active-sessions",   "lens", 24, 0, 12, 8),
+            (f"{p}debits",            "lens", 36, 0, 12, 8),
+            (f"{p}queries-over-time", "lens", 0,  8, 48, 14),
+            (f"{p}slow-over-time",    "lens", 0,  22, 28, 14),
+            (f"{p}queries-by-table",  "lens", 28, 22, 20, 14),
+            (f"{p}balance-checks",    "lens", 0,  36, 24, 12),
+            (f"{p}sessions-over-time","lens", 24, 36, 24, 12),
+            (f"{p}slow-log",          "lens", 0,  48, 48, 14),
         ])
 
 
@@ -477,31 +490,31 @@ def build_dashboard_4(client):
         "transactions impacted by slow queries."
     )
 
-    # Trace duration by service
-    lens_xy(client, f"{p}duration-by-svc", "Transaction Duration by Service",
-            "transaction.duration.us", agg="average", chart_type="bar",
+    # Trace volume by service over time
+    lens_xy(client, f"{p}trace-count", "Trace Volume by Service",
+            "span.duration.us", agg="count", chart_type="bar_stacked",
+            breakdown_field="service.name", data_view_id="traces-otel",
+            value_label="Span Count")
+    lens_pie(client, f"{p}traces-by-svc", "Traces by Service",
+             "span.duration.us", "service.name", agg="count",
+             data_view_id="traces-otel")
+
+    # Span duration by service
+    lens_xy(client, f"{p}duration-by-svc", "Avg Span Duration by Service",
+            "span.duration.us", agg="average", chart_type="bar",
             breakdown_field="service.name", data_view_id="traces-otel",
             value_label="Avg Duration (μs)")
 
-    # Trace volume by service
-    lens_xy(client, f"{p}trace-count", "Trace Volume by Service",
-            "transaction.duration.us", agg="count", chart_type="bar_stacked",
-            breakdown_field="service.name", data_view_id="traces-otel",
-            value_label="Count")
-    lens_pie(client, f"{p}traces-by-svc", "Traces by Service",
-             "transaction.duration.us", "service.name", agg="count",
-             data_view_id="traces-otel")
-
-    # Slowest transactions table
-    lens_table(client, f"{p}slowest-txns", "Slowest Transactions",
+    # Slowest spans table
+    lens_table(client, f"{p}slowest-txns", "Slowest Spans",
                [("service.name", "Service", "terms"),
-                ("transaction.name", "Transaction", "terms"),
-                ("transaction.duration.us", "Max Duration (μs)", "max")],
+                ("span.name", "Span Name", "terms"),
+                ("span.duration.us", "Max Duration (μs)", "max")],
                data_view_id="traces-otel")
 
-    # E2E latency trend
-    lens_xy(client, f"{p}e2e-latency", "End-to-End Latency Trend",
-            "transaction.duration.us", agg="average", chart_type="line",
+    # Span duration trend
+    lens_xy(client, f"{p}e2e-latency", "Span Duration Trend by Service",
+            "span.duration.us", agg="average", chart_type="line",
             breakdown_field="service.name", data_view_id="traces-otel",
             value_label="Avg Duration (μs)")
 
@@ -511,9 +524,9 @@ def build_dashboard_4(client):
         "What distributed tracing unlocks: end-to-end request paths, service dependencies, and latency breakdown.",
         [
             (f"{p}apm-link",        "visualization", 0,  0,  16, 16),
-            (f"{p}duration-by-svc", "lens",          16, 0,  32, 16),
-            (f"{p}trace-count",     "lens",          0,  16, 28, 14),
-            (f"{p}traces-by-svc",   "lens",          28, 16, 20, 14),
+            (f"{p}trace-count",     "lens",          16, 0,  16, 16),
+            (f"{p}traces-by-svc",   "lens",          32, 0,  16, 16),
+            (f"{p}duration-by-svc", "lens",          0,  16, 48, 14),
             (f"{p}slowest-txns",    "lens",          0,  30, 48, 14),
             (f"{p}e2e-latency",     "lens",          0,  44, 48, 14),
         ])
@@ -539,34 +552,38 @@ def build_dashboard_5(client):
     )
 
     # Row 1: Health indicators
-    lens_metric(client, f"{p}total-flows", "Total Flows Executed", "mule.flow.executions", subtitle="MuleSoft")
-    lens_metric(client, f"{p}total-errors", "Total Errors", "mule.flow.errors", subtitle="MuleSoft")
-    lens_metric(client, f"{p}portal-total", "Portal Requests", "portal.requests.total", subtitle="Portal")
-    lens_metric(client, f"{p}notif-sent", "Notifications Sent", "notification.sent.total", subtitle="Notification Svc")
+    lens_metric(client, f"{p}total-flows", "Total Flows Executed", M("mule.flow.executions"), subtitle="MuleSoft")
+    lens_metric(client, f"{p}total-errors", "Total Errors", M("portal.errors.total"), subtitle="Portal")
+    lens_metric(client, f"{p}portal-total", "Portal Requests", M("portal.requests.total"), subtitle="Portal")
+    lens_metric(client, f"{p}notif-sent", "Notifications Sent", M("notification.sent.total"), subtitle="Notification Svc")
 
-    # Row 2: E2E latency
-    lens_xy(client, f"{p}e2e-latency", "End-to-End Latency (MuleSoft Flows)",
-            "mule.flow.duration", agg="average", chart_type="line",
-            breakdown_field="mule.flow.name", value_label="Avg Duration (ms)")
+    # Row 2: MuleSoft flow executions trend
+    lens_xy(client, f"{p}flow-trend", "MuleSoft Flow Executions Over Time",
+            M("mule.flow.executions"), agg="sum", chart_type="line",
+            breakdown_field=A("mule.flow.name"), value_label="Executions")
 
-    # Row 3: Error rate + backend health
-    lens_xy(client, f"{p}error-rate", "Error Rate Over Time",
-            "portal.errors.total", chart_type="area", breakdown_field="portal.operation")
-    lens_xy(client, f"{p}backend-health", "Backend Latency by System",
-            "mule.backend.latency", agg="average", chart_type="bar",
-            breakdown_field="mule.backend", value_label="Avg Latency (ms)")
+    # Row 3: Error rate + backend HTTP requests
+    lens_xy(client, f"{p}error-rate", "Portal Errors Over Time",
+            M("portal.errors.total"), chart_type="area",
+            breakdown_field=A("portal.operation"))
+    lens_xy(client, f"{p}backend-http", "MuleSoft HTTP Requests by Backend",
+            M("mule.http.requests"), chart_type="bar",
+            breakdown_field=A("mule.backend"), value_label="Requests")
 
-    # Row 4: Fraud + AML
-    lens_xy(client, f"{p}fraud-flags", "Fraud Flags Over Time",
-            "fraud.flags.total", chart_type="bar", breakdown_field="fraud.destination_country")
-    lens_xy(client, f"{p}aml-hits", "AML Hits Over Time",
-            "aml.hits.total", chart_type="bar", breakdown_field="aml.risk_level")
-
-    # Row 5: Notifications + slow queries
-    lens_pie(client, f"{p}notif-types", "Notifications by Type",
-             "notification.sent.total", "notification.type")
+    # Row 4: Fraud checks + slow queries
+    lens_xy(client, f"{p}fraud-checks", "Fraud Checks by Risk Level",
+            M("fraud.checks.total"), chart_type="bar",
+            breakdown_field=A("fraud.risk_level"))
     lens_xy(client, f"{p}slow-queries", "Slow Queries (Correlated Impact)",
-            "db.slow_queries.total", chart_type="bar", value_label="Slow Query Count")
+            M("db.slow_queries.total"), chart_type="bar",
+            value_label="Slow Query Count")
+
+    # Row 5: Notifications + tellers active
+    lens_pie(client, f"{p}notif-types", "Notifications by Type",
+             M("notification.sent.total"), A("notification.type"))
+    lens_xy(client, f"{p}tellers", "Active Tellers Over Time",
+            M("portal.tellers.active"), agg="max", chart_type="line",
+            value_label="Active Tellers")
 
     # Row 6: Error log table
     lens_table(client, f"{p}error-logs", "Recent Error & Warning Logs",
@@ -585,13 +602,13 @@ def build_dashboard_5(client):
             (f"{p}total-errors",   "lens",          24, 0,  8,  8),
             (f"{p}portal-total",   "lens",          32, 0,  8,  8),
             (f"{p}notif-sent",     "lens",          40, 0,  8,  8),
-            (f"{p}e2e-latency",    "lens",          16, 8,  32, 12),
+            (f"{p}flow-trend",     "lens",          16, 8,  32, 12),
             (f"{p}error-rate",     "lens",          0,  20, 24, 14),
-            (f"{p}backend-health", "lens",          24, 20, 24, 14),
-            (f"{p}fraud-flags",    "lens",          0,  34, 24, 12),
-            (f"{p}aml-hits",       "lens",          24, 34, 24, 12),
+            (f"{p}backend-http",   "lens",          24, 20, 24, 14),
+            (f"{p}fraud-checks",   "lens",          0,  34, 24, 12),
+            (f"{p}slow-queries",   "lens",          24, 34, 24, 12),
             (f"{p}notif-types",    "lens",          0,  46, 16, 12),
-            (f"{p}slow-queries",   "lens",          16, 46, 32, 12),
+            (f"{p}tellers",        "lens",          16, 46, 32, 12),
             (f"{p}error-logs",     "lens",          0,  58, 48, 14),
         ])
 
