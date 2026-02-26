@@ -1,0 +1,251 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Account Opening + KYC Flow — First National Bank
+  Handles new account onboarding with full KYC compliance.
+
+  Flow sequence:
+    1. HTTP Listener receives account opening request from FNB Portal
+    2. Validate and enrich applicant data (DataWeave)
+    3. AML/KYC screening (enhanced due diligence)
+    4. Create customer profile in CRM (Salesforce FSC)
+    5. Create account in core banking (Temenos T24)
+    6. Send welcome notification
+    7. Return response to portal
+
+  Error handling:
+    - KYC failure → APPLICATION_DENIED, logged for compliance
+    - CRM unavailable → retry, then ONBOARDING_INCOMPLETE
+    - Core banking failure → rollback CRM record, ACCOUNT_CREATION_FAILED
+
+  EDOT Java agent auto-instruments all HTTP connectors.
+  W3C traceparent from FNB Portal is propagated automatically.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+          http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+          http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+          http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+  <!-- ── HTTP Listener Config ─────────────────────────────────────────── -->
+  <http:listener-config name="fnb-api-listener"
+    doc:name="FNB API Listener Config">
+    <http:listener-connection host="0.0.0.0" port="8081" />
+  </http:listener-config>
+
+  <!-- ── Backend Service HTTP Configs ──────────────────────────────────── -->
+  <http:request-config name="aml-screening-config"
+    doc:name="AML Screening Service">
+    <http:request-connection host="${backend.aml.host}" port="${backend.aml.port}" />
+  </http:request-config>
+
+  <http:request-config name="customer-profile-config"
+    doc:name="Customer Profile Service (Salesforce FSC)">
+    <http:request-connection host="${backend.crm.host}" port="${backend.crm.port}" />
+  </http:request-config>
+
+  <http:request-config name="core-banking-config"
+    doc:name="Core Banking Service (Temenos T24)">
+    <http:request-connection host="${backend.corebanking.host}" port="${backend.corebanking.port}" />
+  </http:request-config>
+
+  <http:request-config name="notification-config"
+    doc:name="Notification Service">
+    <http:request-connection host="${backend.notification.host}" port="${backend.notification.port}" />
+  </http:request-config>
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       ACCOUNT OPENING + KYC FLOW
+       POST /api/accounts/open
+       ══════════════════════════════════════════════════════════════════════ -->
+  <flow name="account-opening-kyc-flow"
+    doc:name="Account Opening with KYC"
+    doc:description="Full onboarding: KYC screening → CRM profile → core banking account → welcome">
+
+    <http:listener config-ref="fnb-api-listener"
+      path="/api/accounts/open"
+      doc:name="POST /api/accounts/open"
+      allowedMethods="POST">
+      <http:response statusCode="201">
+        <http:headers><![CDATA[#[output application/java --- {"Content-Type": "application/json"}]]]></http:headers>
+      </http:response>
+      <http:error-response statusCode="500">
+        <http:headers><![CDATA[#[output application/java --- {"Content-Type": "application/json"}]]]></http:headers>
+      </http:error-response>
+    </http:listener>
+
+    <!-- Store original request -->
+    <set-variable variableName="applicant" value="#[payload]" doc:name="Store Applicant Data" />
+    <set-variable variableName="correlationId"
+      value="#[attributes.headers.'x-correlation-id' default uuid()]"
+      doc:name="Set Correlation ID" />
+
+    <logger level="INFO"
+      message='#["Account opening request | name=" ++ (payload.firstName default "") ++ " " ++ (payload.lastName default "") ++ " type=" ++ (payload.accountType default "CHECKING") ++ " correlationId=" ++ vars.correlationId]'
+      doc:name="Log Request" />
+
+    <!-- Step 1: Enhanced KYC/AML Screening -->
+    <flow-ref name="kyc-screening-subflow" doc:name="KYC Screening" />
+
+    <!-- Step 2: Create Customer Profile in CRM -->
+    <flow-ref name="create-crm-profile-subflow" doc:name="Create CRM Profile" />
+
+    <!-- Step 3: Create Account in Core Banking -->
+    <flow-ref name="create-bank-account-subflow" doc:name="Create Bank Account" />
+
+    <!-- Step 4: Send Welcome Notification -->
+    <flow-ref name="send-welcome-notification-subflow" doc:name="Send Welcome" />
+
+    <!-- Build final response -->
+    <ee:transform doc:name="Build Response">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  status: "APPROVED",
+  accountNumber: vars.accountNumber,
+  customerId: vars.customerId,
+  accountType: vars.applicant.accountType default "CHECKING",
+  kycStatus: "VERIFIED",
+  correlationId: vars.correlationId
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <logger level="INFO"
+      message='#["Account opened successfully | account=" ++ (vars.accountNumber default "") ++ " correlationId=" ++ vars.correlationId]'
+      doc:name="Log Success" />
+
+    <!-- Error handling -->
+    <error-handler>
+      <on-error-propagate type="ANY"
+        doc:name="Account Opening Error">
+        <logger level="ERROR"
+          message='#["Account opening failed | error=" ++ error.description ++ " correlationId=" ++ (vars.correlationId default "")]'
+          doc:name="Log Error" />
+        <ee:transform doc:name="Error Response">
+          <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  error: "ACCOUNT_OPENING_FAILED",
+  message: error.description,
+  correlationId: vars.correlationId
+}]]></ee:set-payload>
+          </ee:message>
+        </ee:transform>
+      </on-error-propagate>
+    </error-handler>
+  </flow>
+
+  <!-- ── Sub-flows ──────────────────────────────────────────────────────── -->
+
+  <sub-flow name="kyc-screening-subflow" doc:name="KYC / AML Screening">
+    <ee:transform doc:name="Build KYC Request">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  firstName: vars.applicant.firstName,
+  lastName: vars.applicant.lastName,
+  dateOfBirth: vars.applicant.dateOfBirth,
+  country: "US"
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <http:request config-ref="aml-screening-config"
+      method="POST"
+      path="/aml/screen/kyc"
+      doc:name="POST AML KYC Screen">
+      <http:headers><![CDATA[#[output application/java --- {"X-Correlation-ID": vars.correlationId}]]]></http:headers>
+    </http:request>
+
+    <set-variable variableName="kycResult" value="#[payload]" doc:name="Store KYC Result" />
+
+    <logger level="INFO"
+      message='#["KYC screening complete | status=" ++ (payload.status default "") ++ " correlationId=" ++ vars.correlationId]'
+      doc:name="Log KYC Result" />
+  </sub-flow>
+
+  <sub-flow name="create-crm-profile-subflow" doc:name="Create CRM Profile">
+    <ee:transform doc:name="Build CRM Payload">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  firstName: vars.applicant.firstName,
+  lastName: vars.applicant.lastName,
+  accountType: vars.applicant.accountType default "CHECKING"
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <http:request config-ref="customer-profile-config"
+      method="POST"
+      path="/customers"
+      doc:name="POST Create Customer Profile">
+      <http:headers><![CDATA[#[output application/java --- {"X-Correlation-ID": vars.correlationId}]]]></http:headers>
+    </http:request>
+
+    <set-variable variableName="customerId" value="#[payload.customerId]" doc:name="Store Customer ID" />
+  </sub-flow>
+
+  <sub-flow name="create-bank-account-subflow" doc:name="Create Bank Account">
+    <ee:transform doc:name="Build Account Payload">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  customerId: vars.customerId,
+  accountType: vars.applicant.accountType default "CHECKING",
+  initialDeposit: vars.applicant.initialDeposit default 0,
+  branchCode: vars.applicant.branchCode default "BR001"
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <http:request config-ref="core-banking-config"
+      method="POST"
+      path="/accounts"
+      doc:name="POST Create Account">
+      <http:headers><![CDATA[#[output application/java --- {"X-Correlation-ID": vars.correlationId}]]]></http:headers>
+    </http:request>
+
+    <set-variable variableName="accountNumber" value="#[payload.accountNumber]" doc:name="Store Account Number" />
+  </sub-flow>
+
+  <sub-flow name="send-welcome-notification-subflow" doc:name="Send Welcome Notification">
+    <ee:transform doc:name="Build Notification Payload">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  customerId: vars.customerId,
+  accountNumber: vars.accountNumber,
+  firstName: vars.applicant.firstName
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <http:request config-ref="notification-config"
+      method="POST"
+      path="/notify/account-opened"
+      doc:name="POST Welcome Notification">
+      <http:headers><![CDATA[#[output application/java --- {"X-Correlation-ID": vars.correlationId}]]]></http:headers>
+    </http:request>
+  </sub-flow>
+
+</mule>

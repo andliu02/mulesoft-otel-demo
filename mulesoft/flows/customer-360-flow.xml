@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Customer 360 Flow — First National Bank
+  Aggregates a full customer view from multiple backend systems.
+
+  Flow sequence:
+    1. HTTP Listener receives customer 360 request from FNB Portal
+    2. Scatter-gather (parallel):
+       a. Customer Profile Service (Salesforce FSC) — profile + interactions
+       b. Core Banking — account summary + recent transactions
+    3. DataWeave merge into unified customer 360 payload
+    4. Return aggregated response to portal
+
+  EDOT Java agent auto-instruments:
+    - HTTP listener (inbound span)
+    - All HTTP Request connectors (outbound spans)
+    - Scatter-gather parallel execution
+    - Flow execution time
+
+  W3C traceparent from FNB Portal is propagated automatically.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+          http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+          http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+          http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+  <!-- ── HTTP Listener Config ─────────────────────────────────────────── -->
+  <http:listener-config name="fnb-api-listener"
+    doc:name="FNB API Listener Config">
+    <http:listener-connection host="0.0.0.0" port="8081" />
+  </http:listener-config>
+
+  <!-- ── Backend Service HTTP Configs ──────────────────────────────────── -->
+  <http:request-config name="customer-profile-config"
+    doc:name="Customer Profile Service (Salesforce FSC)">
+    <http:request-connection host="${backend.crm.host}" port="${backend.crm.port}" />
+  </http:request-config>
+
+  <http:request-config name="core-banking-config"
+    doc:name="Core Banking Service (Temenos T24)">
+    <http:request-connection host="${backend.corebanking.host}" port="${backend.corebanking.port}" />
+  </http:request-config>
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       CUSTOMER 360 FLOW
+       GET /api/customers/{customerId}/360
+       ══════════════════════════════════════════════════════════════════════ -->
+  <flow name="customer-360-flow"
+    doc:name="Customer 360 Aggregation"
+    doc:description="Aggregates customer data from CRM and core banking in parallel">
+
+    <http:listener config-ref="fnb-api-listener"
+      path="/api/customers/{customerId}/360"
+      doc:name="GET /api/customers/{customerId}/360"
+      allowedMethods="GET">
+      <http:response statusCode="200">
+        <http:headers><![CDATA[#[output application/java --- {"Content-Type": "application/json"}]]]></http:headers>
+      </http:response>
+      <http:error-response statusCode="500">
+        <http:headers><![CDATA[#[output application/java --- {"Content-Type": "application/json"}]]]></http:headers>
+      </http:error-response>
+    </http:listener>
+
+    <!-- Extract customer ID and set flow variables -->
+    <set-variable variableName="customerId"
+      value="#[attributes.uriParams.customerId]"
+      doc:name="Extract Customer ID" />
+
+    <set-variable variableName="correlationId"
+      value="#[attributes.headers.'x-correlation-id' default uuid()]"
+      doc:name="Set Correlation ID" />
+
+    <logger level="INFO"
+      message='#["Customer 360 request | customerId=" ++ vars.customerId ++ " correlationId=" ++ vars.correlationId]'
+      doc:name="Log Request" />
+
+    <!-- Scatter-Gather: fetch profile + banking data in parallel -->
+    <scatter-gather doc:name="Parallel Customer Data Fetch">
+
+      <!-- Route 1: CRM Profile + Interactions -->
+      <route>
+        <flow-ref name="get-customer-profile-subflow" doc:name="Get CRM Profile" />
+      </route>
+
+      <!-- Route 2: Core Banking Account Data -->
+      <route>
+        <flow-ref name="get-customer-accounts-subflow" doc:name="Get Account Data" />
+      </route>
+
+    </scatter-gather>
+
+    <!-- Merge results into unified 360 view -->
+    <ee:transform doc:name="Merge Customer 360">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  customerId: vars.customerId,
+  profile: payload[0].payload,
+  accounts: payload[1].payload,
+  correlationId: vars.correlationId,
+  aggregatedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"}
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <logger level="INFO"
+      message='#["Customer 360 complete | customerId=" ++ vars.customerId ++ " correlationId=" ++ vars.correlationId]'
+      doc:name="Log Complete" />
+
+    <!-- Error handling -->
+    <error-handler>
+      <on-error-propagate type="ANY"
+        doc:name="Customer 360 Error">
+        <logger level="ERROR"
+          message='#["Customer 360 failed | customerId=" ++ (vars.customerId default "unknown") ++ " error=" ++ error.description]'
+          doc:name="Log Error" />
+        <ee:transform doc:name="Error Response">
+          <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  error: "CUSTOMER_360_FAILED",
+  message: error.description,
+  correlationId: vars.correlationId
+}]]></ee:set-payload>
+          </ee:message>
+        </ee:transform>
+      </on-error-propagate>
+    </error-handler>
+  </flow>
+
+  <!-- ── Sub-flows ──────────────────────────────────────────────────────── -->
+
+  <sub-flow name="get-customer-profile-subflow"
+    doc:name="Get Customer Profile from CRM">
+
+    <http:request config-ref="customer-profile-config"
+      method="GET"
+      path="/customers/{customerId}/profile"
+      doc:name="GET CRM Profile">
+      <http:uri-params><![CDATA[#[output application/java --- {customerId: vars.customerId}]]]></http:uri-params>
+      <http:headers><![CDATA[#[output application/java --- {"X-Correlation-ID": vars.correlationId}]]]></http:headers>
+    </http:request>
+
+    <http:request config-ref="customer-profile-config"
+      method="GET"
+      path="/customers/{customerId}/interactions"
+      doc:name="GET CRM Interactions">
+      <http:uri-params><![CDATA[#[output application/java --- {customerId: vars.customerId}]]]></http:uri-params>
+      <http:headers><![CDATA[#[output application/java --- {"X-Correlation-ID": vars.correlationId}]]]></http:headers>
+    </http:request>
+  </sub-flow>
+
+  <sub-flow name="get-customer-accounts-subflow"
+    doc:name="Get Customer Accounts from Core Banking">
+
+    <http:request config-ref="core-banking-config"
+      method="GET"
+      path="/accounts/{customerId}/balance"
+      doc:name="GET Account Balance">
+      <http:uri-params><![CDATA[#[output application/java --- {customerId: vars.customerId}]]]></http:uri-params>
+      <http:headers><![CDATA[#[output application/java --- {"X-Correlation-ID": vars.correlationId}]]]></http:headers>
+    </http:request>
+
+    <http:request config-ref="core-banking-config"
+      method="GET"
+      path="/accounts/{customerId}/transactions?days=30"
+      doc:name="GET Recent Transactions">
+      <http:uri-params><![CDATA[#[output application/java --- {customerId: vars.customerId}]]]></http:uri-params>
+      <http:headers><![CDATA[#[output application/java --- {"X-Correlation-ID": vars.correlationId}]]]></http:headers>
+    </http:request>
+  </sub-flow>
+
+</mule>

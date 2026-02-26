@@ -1,0 +1,128 @@
+version: "3.9"
+
+# ── FNB App VM — First National Bank Backend Services + Portal ─────────────────
+# Runs on: aliu-fnb-app-vm (e2-standard-4)
+#
+# Services:
+#   fnb-portal             → bank teller portal (Tier 1) :8080
+#   core-banking-svc       → Temenos T24 mock             :9001
+#   fraud-detection-svc    → FICO Falcon mock              :9002
+#   aml-screening-svc      → Dow Jones RC mock             :9003
+#   customer-profile-svc   → Salesforce FSC mock           :9004
+#   notification-svc       → SMS/email gateway mock        :9005
+#   otel-collector         → routes all signals to Elastic
+
+services:
+
+  # ── OTel Collector ──────────────────────────────────────────────────────────
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.104.0
+    command: ["--config=/etc/otelcol/otel-collector-config.yml"]
+    volumes:
+      - ./otel-collector/otel-collector-config.yml:/etc/otelcol/otel-collector-config.yml
+    ports:
+      - "4317:4317"     # OTLP gRPC (backend services export here)
+      - "4318:4318"     # OTLP HTTP
+      - "8888:8888"     # Collector self-metrics
+    environment:
+      - ELASTIC_OTLP_ENDPOINT=${ELASTIC_OTLP_ENDPOINT}
+      - ELASTIC_API_KEY=${ELASTIC_API_KEY}
+    restart: unless-stopped
+
+  # ── FNB Portal (Tier 1) ─────────────────────────────────────────────────────
+  fnb-portal:
+    build: ./fnb-portal
+    ports:
+      - "8080:8080"
+    environment:
+      - OTLP_ENDPOINT=http://otel-collector:4317
+      - MULESOFT_URL=http://${INTEGRATION_VM_IP}:8081
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Core Banking Service ────────────────────────────────────────────────────
+  core-banking-svc:
+    build: ./backend-services/core-banking-svc
+    ports:
+      - "9001:9001"
+    environment:
+      - OTLP_ENDPOINT=http://otel-collector:4317
+      - SLOW_QUERY_RATE=0.10      # 10% of balance checks inject slow query
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9001/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Fraud Detection Service ─────────────────────────────────────────────────
+  fraud-detection-svc:
+    build: ./backend-services/fraud-detection-svc
+    ports:
+      - "9002:9002"
+    environment:
+      - OTLP_ENDPOINT=http://otel-collector:4317
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9002/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── AML Screening Service ───────────────────────────────────────────────────
+  aml-screening-svc:
+    build: ./backend-services/aml-screening-svc
+    ports:
+      - "9003:9003"
+    environment:
+      - OTLP_ENDPOINT=http://otel-collector:4317
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9003/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Customer Profile Service ────────────────────────────────────────────────
+  customer-profile-svc:
+    build: ./backend-services/customer-profile-svc
+    ports:
+      - "9004:9004"
+    environment:
+      - OTLP_ENDPOINT=http://otel-collector:4317
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9004/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Notification Service ────────────────────────────────────────────────────
+  notification-svc:
+    build: ./backend-services/notification-svc
+    ports:
+      - "9005:9005"
+    environment:
+      - OTLP_ENDPOINT=http://otel-collector:4317
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9005/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5

@@ -1,0 +1,417 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Payment Processing Flow — First National Bank
+  Handles both wire transfers and ACH payments.
+
+  Flow sequence:
+    1. HTTP Listener receives payment request from FNB Portal
+    2. Validate and enrich payload (DataWeave)
+    3. Fraud detection (synchronous, must pass)
+    4. AML / OFAC screening (synchronous, must pass)
+    5. Core banking — validate balance (THIS IS THE SLOW QUERY POINT)
+    6. Core banking — debit account
+    7. Notification — confirm to customer
+    8. Return response to portal
+
+  Error handling:
+    - Fraud block → PAYMENT_BLOCKED error, logged, no debit
+    - AML hit → COMPLIANCE_BLOCK error, filed for regulatory reporting
+    - Core banking timeout → CORE_BANKING_UNAVAILABLE, retry once
+    - Any other error → PAYMENT_FAILED, DLQ
+
+  EDOT Java agent auto-instruments:
+    - This HTTP listener (inbound span)
+    - All HTTP Request connectors (outbound spans)
+    - Flow execution time
+    - JVM metrics
+
+  W3C traceparent from FNB Portal is propagated automatically
+  by the EDOT agent through all outbound calls.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+          http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+          http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+          http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+  <!-- ── HTTP Listener Config ─────────────────────────────────────────── -->
+  <http:listener-config name="fnb-api-listener"
+    doc:name="FNB API Listener Config">
+    <http:listener-connection host="0.0.0.0" port="8081" />
+  </http:listener-config>
+
+  <!-- ── Backend Service HTTP Configs ──────────────────────────────────── -->
+  <http:request-config name="fraud-detection-config"
+    doc:name="Fraud Detection Service">
+    <http:request-connection host="${backend.fraud.host}" port="${backend.fraud.port}" />
+  </http:request-config>
+
+  <http:request-config name="aml-screening-config"
+    doc:name="AML Screening Service">
+    <http:request-connection host="${backend.aml.host}" port="${backend.aml.port}" />
+  </http:request-config>
+
+  <http:request-config name="core-banking-config"
+    doc:name="Core Banking Service (Temenos T24)">
+    <http:request-connection host="${backend.corebanking.host}" port="${backend.corebanking.port}" />
+  </http:request-config>
+
+  <http:request-config name="notification-config"
+    doc:name="Notification Service">
+    <http:request-connection host="${backend.notification.host}" port="${backend.notification.port}" />
+  </http:request-config>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!-- WIRE TRANSFER FLOW                                                  -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <flow name="payment-processing-wire-flow" doc:name="Wire Transfer Processing">
+    <http:listener
+      doc:name="POST /api/payments/wire"
+      config-ref="fnb-api-listener"
+      path="/api/payments/wire"
+      allowedMethods="POST" />
+
+    <set-variable
+      doc:name="Set Correlation ID"
+      variableName="correlationId"
+      value="#[attributes.headers['X-Correlation-ID'] default uuid()]" />
+
+    <logger
+      doc:name="Log Payment Received"
+      level="INFO"
+      message='#["Wire payment received | correlationId=" ++ vars.correlationId ++ " amount=" ++ (payload.amount as String default "unknown")]' />
+
+    <!-- Step 1: Enrich and validate payload -->
+    <ee:transform doc:name="Enrich Payment Payload">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  transactionId: uuid(),
+  paymentType: "WIRE",
+  sourceAccount: payload.sourceAccount,
+  destinationAccount: payload.destinationAccount,
+  amount: payload.amount as Number,
+  currency: payload.currency default "USD",
+  destinationCountry: payload.destinationCountry default "US",
+  purpose: payload.purpose default "TRANSFER",
+  correlationId: vars.correlationId,
+  initiatedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSZ"},
+  channel: "PORTAL"
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <set-variable variableName="paymentPayload" value="#[payload]" />
+
+    <!-- Step 2: Fraud Screening -->
+    <http:request
+      doc:name="Fraud Detection — Score Transaction"
+      config-ref="fraud-detection-config"
+      method="POST"
+      path="/score">
+      <http:headers><![CDATA[#[{
+        "X-Correlation-ID": vars.correlationId,
+        "X-Source-System": "mulesoft-payment-flow"
+      }]]]></http:headers>
+      <http:body><![CDATA[%dw 2.0
+output application/json
+---
+{
+  transactionId: vars.paymentPayload.transactionId,
+  amount: vars.paymentPayload.amount,
+  currency: vars.paymentPayload.currency,
+  sourceAccount: vars.paymentPayload.sourceAccount,
+  destination: vars.paymentPayload.destinationAccount,
+  destinationCountry: vars.paymentPayload.destinationCountry,
+  paymentType: "WIRE"
+}]]></http:body>
+    </http:request>
+
+    <set-variable variableName="fraudResult" value="#[payload]" />
+
+    <!-- Block if fraud score too high -->
+    <choice doc:name="Fraud Decision">
+      <when expression='#[vars.fraudResult.decision == "BLOCK"]'>
+        <logger level="WARN"
+          message='#["Payment BLOCKED by fraud | score=" ++ (vars.fraudResult.score as String) ++ " correlationId=" ++ vars.correlationId]' />
+        <raise-error type="PAYMENT:FRAUD_BLOCK" description="Transaction blocked by fraud detection" />
+      </when>
+      <otherwise>
+        <logger level="INFO"
+          message='#["Fraud check passed | score=" ++ (vars.fraudResult.score as String) ++ " decision=" ++ vars.fraudResult.decision]' />
+      </otherwise>
+    </choice>
+
+    <!-- Step 3: AML / OFAC Screening -->
+    <http:request
+      doc:name="AML Screening — OFAC Check"
+      config-ref="aml-screening-config"
+      method="POST"
+      path="/screen">
+      <http:headers><![CDATA[#[{
+        "X-Correlation-ID": vars.correlationId,
+        "X-Source-System": "mulesoft-payment-flow"
+      }]]]></http:headers>
+      <http:body><![CDATA[%dw 2.0
+output application/json
+---
+{
+  amount: vars.paymentPayload.amount,
+  currency: vars.paymentPayload.currency,
+  destinationCountry: vars.paymentPayload.destinationCountry,
+  paymentType: "WIRE",
+  purpose: vars.paymentPayload.purpose
+}]]></http:body>
+    </http:request>
+
+    <set-variable variableName="amlResult" value="#[payload]" />
+
+    <choice doc:name="AML Decision">
+      <when expression='#[vars.amlResult.result == "BLOCKED"]'>
+        <logger level="ERROR"
+          message='#["OFAC HIT — payment blocked | screeningId=" ++ vars.amlResult.screeningId ++ " correlationId=" ++ vars.correlationId]' />
+        <raise-error type="PAYMENT:AML_BLOCK" description="Transaction blocked by AML/OFAC screening" />
+      </when>
+      <otherwise>
+        <logger level="INFO" message='#["AML cleared | result=" ++ vars.amlResult.result ++ " correlationId=" ++ vars.correlationId]' />
+      </otherwise>
+    </choice>
+
+    <!-- Step 4: Core Banking — Validate Balance (SLOW QUERY INJECTION POINT) -->
+    <http:request
+      doc:name="Core Banking — Validate Balance"
+      config-ref="core-banking-config"
+      method="GET"
+      path="#['/accounts/' ++ vars.paymentPayload.sourceAccount ++ '/balance']">
+      <http:headers><![CDATA[#[{
+        "X-Correlation-ID": vars.correlationId,
+        "X-Source-System": "mulesoft-payment-flow"
+      }]]]></http:headers>
+    </http:request>
+
+    <set-variable variableName="balanceResult" value="#[payload]" />
+
+    <!-- Step 5: Core Banking — Debit Account -->
+    <http:request
+      doc:name="Core Banking — Debit Account"
+      config-ref="core-banking-config"
+      method="POST"
+      path="#['/accounts/' ++ vars.paymentPayload.sourceAccount ++ '/debit']">
+      <http:headers><![CDATA[#[{
+        "X-Correlation-ID": vars.correlationId,
+        "X-Source-System": "mulesoft-payment-flow"
+      }]]]></http:headers>
+      <http:body><![CDATA[%dw 2.0
+output application/json
+---
+{
+  amount: vars.paymentPayload.amount,
+  currency: vars.paymentPayload.currency,
+  reference: vars.correlationId,
+  paymentType: "WIRE",
+  destinationAccount: vars.paymentPayload.destinationAccount
+}]]></http:body>
+    </http:request>
+
+    <set-variable variableName="debitResult" value="#[payload]" />
+
+    <!-- Step 6: Send Confirmation Notification -->
+    <http:request
+      doc:name="Notification — Payment Confirmation"
+      config-ref="notification-config"
+      method="POST"
+      path="/notify">
+      <http:headers><![CDATA[#[{
+        "X-Correlation-ID": vars.correlationId
+      }]]]></http:headers>
+      <http:body><![CDATA[%dw 2.0
+output application/json
+---
+{
+  channel: "SMS",
+  type: "TRANSACTION_CONFIRMATION",
+  recipient: vars.paymentPayload.sourceAccount,
+  message: "Wire transfer of " ++ vars.paymentPayload.currency ++ " " ++ (vars.paymentPayload.amount as String) ++ " initiated. Ref: " ++ vars.correlationId
+}]]></http:body>
+    </http:request>
+
+    <!-- Step 7: Build response -->
+    <ee:transform doc:name="Build Payment Response">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  paymentId: vars.debitResult.transactionId,
+  status: "SUBMITTED",
+  paymentType: "WIRE",
+  amount: vars.paymentPayload.amount,
+  currency: vars.paymentPayload.currency,
+  correlationId: vars.correlationId,
+  fraudScore: vars.fraudResult.score,
+  amlResult: vars.amlResult.result,
+  estimatedSettlement: (now() + |P1D|) as String {format: "yyyy-MM-dd"},
+  reference: vars.debitResult.transactionId
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <logger level="INFO"
+      message='#["Wire payment processed | paymentId=" ++ payload.paymentId ++ " amount=" ++ (vars.paymentPayload.amount as String) ++ " correlationId=" ++ vars.correlationId]' />
+
+    <!-- Error Handler -->
+    <error-handler>
+      <on-error-propagate type="PAYMENT:FRAUD_BLOCK">
+        <ee:transform>
+          <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ error: "PAYMENT_BLOCKED", reason: "FRAUD_DETECTION", correlationId: vars.correlationId }]]></ee:set-payload>
+          </ee:message>
+          <ee:variables><ee:set-variable variableName="httpStatus" value="422" /></ee:variables>
+        </ee:transform>
+      </on-error-propagate>
+      <on-error-propagate type="PAYMENT:AML_BLOCK">
+        <ee:transform>
+          <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ error: "PAYMENT_BLOCKED", reason: "COMPLIANCE_AML_OFAC", correlationId: vars.correlationId }]]></ee:set-payload>
+          </ee:message>
+          <ee:variables><ee:set-variable variableName="httpStatus" value="422" /></ee:variables>
+        </ee:transform>
+      </on-error-propagate>
+      <on-error-propagate type="ANY">
+        <logger level="ERROR"
+          message='#["Payment processing failed | correlationId=" ++ vars.correlationId ++ " error=" ++ error.description]' />
+        <ee:transform>
+          <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ error: "PAYMENT_FAILED", correlationId: vars.correlationId, description: error.description }]]></ee:set-payload>
+          </ee:message>
+          <ee:variables><ee:set-variable variableName="httpStatus" value="500" /></ee:variables>
+        </ee:transform>
+      </on-error-propagate>
+    </error-handler>
+  </flow>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!-- ACH PAYMENT FLOW (reuses same sub-flows)                           -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <flow name="payment-processing-ach-flow" doc:name="ACH Payment Processing">
+    <http:listener
+      doc:name="POST /api/payments/ach"
+      config-ref="fnb-api-listener"
+      path="/api/payments/ach"
+      allowedMethods="POST" />
+
+    <set-variable variableName="correlationId"
+      value="#[attributes.headers['X-Correlation-ID'] default uuid()]" />
+
+    <logger level="INFO"
+      message='#["ACH payment received | correlationId=" ++ vars.correlationId ++ " amount=" ++ (payload.amount as String default "unknown")]' />
+
+    <!-- ACH has lower fraud thresholds, flows through same services -->
+    <ee:transform doc:name="Enrich ACH Payload">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  transactionId: uuid(),
+  paymentType: "ACH",
+  sourceAccount: payload.sourceAccount,
+  destinationRouting: payload.destinationRouting,
+  destinationAccount: payload.destinationAccount,
+  amount: payload.amount as Number,
+  currency: payload.currency default "USD",
+  secCode: payload.secCode default "PPD",
+  correlationId: vars.correlationId,
+  initiatedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSZ"}
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <set-variable variableName="paymentPayload" value="#[payload]" />
+
+    <!-- Fraud check -->
+    <http:request doc:name="Fraud Detection — Score ACH"
+      config-ref="fraud-detection-config" method="POST" path="/score">
+      <http:headers><![CDATA[#[{"X-Correlation-ID": vars.correlationId}]]]></http:headers>
+      <http:body><![CDATA[%dw 2.0 output application/json ---
+{ transactionId: vars.paymentPayload.transactionId, amount: vars.paymentPayload.amount,
+  currency: "USD", paymentType: "ACH", sourceAccount: vars.paymentPayload.sourceAccount }]]></http:body>
+    </http:request>
+    <set-variable variableName="fraudResult" value="#[payload]" />
+
+    <!-- AML check -->
+    <http:request doc:name="AML Screening — ACH"
+      config-ref="aml-screening-config" method="POST" path="/screen">
+      <http:headers><![CDATA[#[{"X-Correlation-ID": vars.correlationId}]]]></http:headers>
+      <http:body><![CDATA[%dw 2.0 output application/json ---
+{ amount: vars.paymentPayload.amount, currency: "USD", paymentType: "ACH", destinationCountry: "US" }]]></http:body>
+    </http:request>
+    <set-variable variableName="amlResult" value="#[payload]" />
+
+    <!-- Core banking debit (slow query injection point) -->
+    <http:request doc:name="Core Banking — Validate Balance (ACH)"
+      config-ref="core-banking-config" method="GET"
+      path="#['/accounts/' ++ vars.paymentPayload.sourceAccount ++ '/balance']">
+      <http:headers><![CDATA[#[{"X-Correlation-ID": vars.correlationId}]]]></http:headers>
+    </http:request>
+
+    <http:request doc:name="Core Banking — Debit (ACH)"
+      config-ref="core-banking-config" method="POST"
+      path="#['/accounts/' ++ vars.paymentPayload.sourceAccount ++ '/debit']">
+      <http:headers><![CDATA[#[{"X-Correlation-ID": vars.correlationId}]]]></http:headers>
+      <http:body><![CDATA[%dw 2.0 output application/json ---
+{ amount: vars.paymentPayload.amount, currency: "USD",
+  reference: vars.correlationId, paymentType: "ACH" }]]></http:body>
+    </http:request>
+
+    <set-variable variableName="debitResult" value="#[payload]" />
+
+    <!-- Notification -->
+    <http:request doc:name="Notification — ACH Confirmation"
+      config-ref="notification-config" method="POST" path="/notify">
+      <http:body><![CDATA[%dw 2.0 output application/json ---
+{ channel: "EMAIL", type: "TRANSACTION_CONFIRMATION",
+  recipient: vars.paymentPayload.sourceAccount,
+  message: "ACH payment of USD " ++ (vars.paymentPayload.amount as String) ++ " submitted. Ref: " ++ vars.correlationId }]]></http:body>
+    </http:request>
+
+    <ee:transform doc:name="Build ACH Response">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  paymentId: vars.debitResult.transactionId,
+  status: "SUBMITTED",
+  paymentType: "ACH",
+  amount: vars.paymentPayload.amount,
+  currency: "USD",
+  correlationId: vars.correlationId,
+  estimatedSettlement: (now() + |P2D|) as String {format: "yyyy-MM-dd"}
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <logger level="INFO"
+      message='#["ACH payment processed | paymentId=" ++ payload.paymentId ++ " correlationId=" ++ vars.correlationId]' />
+  </flow>
+
+</mule>

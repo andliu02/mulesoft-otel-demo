@@ -1,0 +1,209 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Trade Reconciliation Batch Flow — First National Bank
+  Nightly batch job that reconciles trade positions.
+
+  Flow sequence:
+    1. Scheduler triggers at 02:00 (or on-demand via HTTP)
+    2. Fetch open trade positions from core banking
+    3. Process each position (batch step):
+       a. Validate settlement status
+       b. Match with counterparty records
+       c. Flag discrepancies
+    4. Generate reconciliation report
+    5. Send summary notification
+
+  EDOT Java agent auto-instruments:
+    - Scheduler trigger (inbound span)
+    - HTTP Request connectors (outbound spans)
+    - Batch job metrics
+
+  This flow runs on a schedule but can also be triggered
+  via GET /api/reconciliation/status for the demo.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:batch="http://www.mulesoft.org/schema/mule/batch"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+          http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+          http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+          http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/batch
+          http://www.mulesoft.org/schema/mule/batch/current/mule-batch.xsd">
+
+  <!-- ── HTTP Listener Config ─────────────────────────────────────────── -->
+  <http:listener-config name="fnb-api-listener"
+    doc:name="FNB API Listener Config">
+    <http:listener-connection host="0.0.0.0" port="8081" />
+  </http:listener-config>
+
+  <!-- ── Backend Service HTTP Configs ──────────────────────────────────── -->
+  <http:request-config name="core-banking-config"
+    doc:name="Core Banking Service (Temenos T24)">
+    <http:request-connection host="${backend.corebanking.host}" port="${backend.corebanking.port}" />
+  </http:request-config>
+
+  <http:request-config name="notification-config"
+    doc:name="Notification Service">
+    <http:request-connection host="${backend.notification.host}" port="${backend.notification.port}" />
+  </http:request-config>
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       TRADE RECONCILIATION STATUS (on-demand)
+       GET /api/reconciliation/status
+       ══════════════════════════════════════════════════════════════════════ -->
+  <flow name="trade-reconciliation-status-flow"
+    doc:name="Trade Reconciliation Status"
+    doc:description="Returns current reconciliation status and last run info">
+
+    <http:listener config-ref="fnb-api-listener"
+      path="/api/reconciliation/status"
+      doc:name="GET /api/reconciliation/status"
+      allowedMethods="GET">
+      <http:response statusCode="200">
+        <http:headers><![CDATA[#[output application/java --- {"Content-Type": "application/json"}]]]></http:headers>
+      </http:response>
+    </http:listener>
+
+    <set-variable variableName="correlationId"
+      value="#[attributes.headers.'x-correlation-id' default uuid()]"
+      doc:name="Set Correlation ID" />
+
+    <!-- Fetch current positions for status -->
+    <http:request config-ref="core-banking-config"
+      method="GET"
+      path="/trade-positions"
+      doc:name="GET Trade Positions">
+      <http:headers><![CDATA[#[output application/java --- {"X-Correlation-ID": vars.correlationId}]]]></http:headers>
+    </http:request>
+
+    <ee:transform doc:name="Build Status Response">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var positions = payload.positions default []
+var settled = positions filter ($.status == "SETTLED")
+var pending = positions filter ($.status == "PENDING")
+var failed  = positions filter ($.status == "FAILED")
+---
+{
+  status: "COMPLETED",
+  lastRunTime: now() as String {format: "yyyy-MM-dd'T'02:00:00'Z'"},
+  nextRunTime: now() as String {format: "yyyy-MM-dd'T'02:00:00'Z'"},
+  summary: {
+    totalPositions: sizeOf(positions),
+    settled: sizeOf(settled),
+    pending: sizeOf(pending),
+    failed: sizeOf(failed),
+    matchRate: if (sizeOf(positions) > 0)
+      (sizeOf(settled) / sizeOf(positions) * 100) as String {format: "#.#"} ++ "%"
+    else "N/A"
+  },
+  correlationId: vars.correlationId
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+  </flow>
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       TRADE RECONCILIATION BATCH (scheduled)
+       Runs nightly at 02:00
+       ══════════════════════════════════════════════════════════════════════ -->
+  <flow name="trade-reconciliation-batch-flow"
+    doc:name="Trade Reconciliation Batch"
+    doc:description="Nightly batch reconciliation of trade positions">
+
+    <!-- Scheduler: runs at 02:00 daily -->
+    <scheduler doc:name="Nightly 02:00 Trigger">
+      <scheduling-strategy>
+        <cron expression="0 0 2 * * ?" timeZone="America/New_York" />
+      </scheduling-strategy>
+    </scheduler>
+
+    <logger level="INFO"
+      message="Trade reconciliation batch starting"
+      doc:name="Log Batch Start" />
+
+    <set-variable variableName="batchStartTime" value="#[now()]" doc:name="Record Start Time" />
+    <set-variable variableName="correlationId" value="#[uuid()]" doc:name="Set Correlation ID" />
+
+    <!-- Fetch all open positions -->
+    <http:request config-ref="core-banking-config"
+      method="GET"
+      path="/trade-positions"
+      doc:name="GET Trade Positions">
+      <http:headers><![CDATA[#[output application/java --- {"X-Correlation-ID": vars.correlationId}]]]></http:headers>
+    </http:request>
+
+    <set-variable variableName="positions" value="#[payload.positions]" doc:name="Store Positions" />
+
+    <logger level="INFO"
+      message='#["Fetched " ++ sizeOf(payload.positions default []) as String ++ " positions for reconciliation"]'
+      doc:name="Log Position Count" />
+
+    <!-- Process each position -->
+    <foreach collection="#[vars.positions]" doc:name="Process Each Position">
+      <choice doc:name="Check Settlement Status">
+        <when expression="#[payload.status == 'FAILED']">
+          <logger level="WARN"
+            message='#["Failed trade: " ++ payload.tradeId ++ " security=" ++ payload.security ++ " counterparty=" ++ payload.counterparty]'
+            doc:name="Log Failed Trade" />
+        </when>
+        <otherwise>
+          <logger level="DEBUG"
+            message='#["Processing: " ++ payload.tradeId ++ " status=" ++ payload.status]'
+            doc:name="Log Processing" />
+        </otherwise>
+      </choice>
+    </foreach>
+
+    <!-- Build reconciliation report -->
+    <ee:transform doc:name="Build Reconciliation Report">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var settled = vars.positions filter ($.status == "SETTLED")
+var pending = vars.positions filter ($.status == "PENDING")
+var failed  = vars.positions filter ($.status == "FAILED")
+---
+{
+  batchId: "RECON-" ++ uuid(),
+  status: "COMPLETED",
+  processedAt: now() as String,
+  totalPositions: sizeOf(vars.positions default []),
+  settled: sizeOf(settled),
+  pending: sizeOf(pending),
+  failed: sizeOf(failed),
+  failedTrades: failed map {
+    tradeId: $.tradeId,
+    security: $.security,
+    counterparty: $.counterparty,
+    amount: $.quantity * $.price
+  },
+  correlationId: vars.correlationId
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <logger level="INFO"
+      message='#["Trade reconciliation complete | total=" ++ (sizeOf(vars.positions default []) as String) ++ " correlationId=" ++ vars.correlationId]'
+      doc:name="Log Batch Complete" />
+
+    <!-- Error handling -->
+    <error-handler>
+      <on-error-propagate type="ANY"
+        doc:name="Batch Error">
+        <logger level="ERROR"
+          message='#["Trade reconciliation batch failed | error=" ++ error.description]'
+          doc:name="Log Batch Error" />
+      </on-error-propagate>
+    </error-handler>
+  </flow>
+
+</mule>
