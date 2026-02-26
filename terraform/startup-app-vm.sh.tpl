@@ -173,65 +173,23 @@ service:
       exporters: [otlp/elastic, debug]
 OTEL
 
-# ── Write service source files ───────────────────────────────────────────────
-# (app files are cloned from GitHub in production — for standalone demo they're embedded)
+# ── Clone repo and copy service source files ─────────────────────────────────
+echo "Cloning service source code from GitHub..."
+git clone https://github.com/andliu02/mulesoft-otel-demo.git /tmp/repo
 
-# Portal
-mkdir -p "$APP_DIR/fnb-portal"
-cat > "$APP_DIR/fnb-portal/requirements.txt" << 'REQ'
-flask==3.0.3
-requests==2.32.3
-opentelemetry-api==1.26.0
-opentelemetry-sdk==1.26.0
-opentelemetry-instrumentation-flask==0.47b0
-opentelemetry-instrumentation-requests==0.47b0
-opentelemetry-exporter-otlp-proto-grpc==1.26.0
-REQ
+# Copy portal files
+cp -r /tmp/repo/fnb-portal/* "$APP_DIR/fnb-portal/"
 
-cat > "$APP_DIR/fnb-portal/Dockerfile" << 'DEOF'
-FROM python:3.12-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py .
-EXPOSE 8080
-CMD ["python", "app.py"]
-DEOF
-
-# Copy service files from GitHub repo (adjust URL to your actual repo)
-# For standalone: service files are written inline above in the startup script
-# In production, replace with: git clone https://github.com/YOUR_ORG/fnb-mulesoft-otel-demo.git
-
-# Write minimal service stubs — full versions are in the repo
-for SVC_PORT in "core-banking-svc:9001" "fraud-detection-svc:9002" "aml-screening-svc:9003" "customer-profile-svc:9004" "notification-svc:9005"; do
-  SVC=$(echo $SVC_PORT | cut -d: -f1)
-  PORT=$(echo $SVC_PORT | cut -d: -f2)
-  mkdir -p "$APP_DIR/backend-services/$SVC"
-  cat > "$APP_DIR/backend-services/$SVC/requirements.txt" << 'REQ'
-flask==3.0.3
-requests==2.32.3
-opentelemetry-api==1.26.0
-opentelemetry-sdk==1.26.0
-opentelemetry-instrumentation-flask==0.47b0
-opentelemetry-instrumentation-requests==0.47b0
-opentelemetry-exporter-otlp-proto-grpc==1.26.0
-REQ
-  cat > "$APP_DIR/backend-services/$SVC/Dockerfile" << DEOF
-FROM python:3.12-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py .
-EXPOSE $PORT
-CMD ["python", "app.py"]
-DEOF
+# Copy backend service files
+for SVC in core-banking-svc fraud-detection-svc aml-screening-svc customer-profile-svc notification-svc; do
+  cp -r /tmp/repo/backend-services/$SVC/* "$APP_DIR/backend-services/$SVC/"
 done
 
-# NOTE: In production deployment, the app.py files for each service are copied
-# from your GitHub repo. Add this step:
-#   git clone https://github.com/YOUR_ORG/fnb-mulesoft-otel-demo.git /tmp/repo
-#   cp -r /tmp/repo/backend-services/* $APP_DIR/backend-services/
-#   cp -r /tmp/repo/fnb-portal/* $APP_DIR/fnb-portal/
+# Copy OTel collector config from repo (overwrite the inline one)
+cp /tmp/repo/otel-collector/otel-collector-config.yml "$APP_DIR/otel-collector/otel-collector-config.yml"
+
+rm -rf /tmp/repo
+echo "Service source files copied from repo."
 
 # ── Launch ──────────────────────────────────────────────────────────────────
 echo "Starting containers..."
