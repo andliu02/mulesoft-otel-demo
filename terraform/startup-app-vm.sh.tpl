@@ -187,6 +187,13 @@ done
 # Copy OTel collector config from repo (overwrite the inline one)
 cp /tmp/repo/otel-collector/otel-collector-config.yml "$APP_DIR/otel-collector/otel-collector-config.yml"
 
+# Copy MuleSoft proxy
+mkdir -p "$APP_DIR/mulesoft-proxy"
+cp -r /tmp/repo/mulesoft-proxy/* "$APP_DIR/mulesoft-proxy/"
+
+# Copy docker-compose.yml from repo (overwrite the inline one)
+cp /tmp/repo/docker-compose.yml "$APP_DIR/docker-compose.yml"
+
 rm -rf /tmp/repo
 echo "Service source files copied from repo."
 

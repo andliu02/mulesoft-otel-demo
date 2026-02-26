@@ -10,6 +10,7 @@ version: "3.9"
 #   aml-screening-svc      → Dow Jones RC mock             :9003
 #   customer-profile-svc   → Salesforce FSC mock           :9004
 #   notification-svc       → SMS/email gateway mock        :9005
+#   mulesoft-proxy         → MuleSoft Anypoint mock          :8081
 #   otel-collector         → routes all signals to Elastic
 
 services:
@@ -36,12 +37,39 @@ services:
       - "8080:8080"
     environment:
       - OTLP_ENDPOINT=http://otel-collector:4317
-      - MULESOFT_URL=http://${INTEGRATION_VM_IP}:8081
+      - MULESOFT_URL=http://mulesoft-proxy:8081
     depends_on:
       - otel-collector
+      - mulesoft-proxy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── MuleSoft Anypoint Runtime Mock ───────────────────────────────────────────
+  mulesoft-proxy:
+    build: ./mulesoft-proxy
+    ports:
+      - "8081:8081"
+    environment:
+      - OTLP_ENDPOINT=http://otel-collector:4317
+      - CORE_BANKING_URL=http://core-banking-svc:9001
+      - FRAUD_URL=http://fraud-detection-svc:9002
+      - AML_URL=http://aml-screening-svc:9003
+      - CRM_URL=http://customer-profile-svc:9004
+      - NOTIFICATION_URL=http://notification-svc:9005
+    depends_on:
+      - otel-collector
+      - core-banking-svc
+      - fraud-detection-svc
+      - aml-screening-svc
+      - customer-profile-svc
+      - notification-svc
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')"]
       interval: 15s
       timeout: 5s
       retries: 5
