@@ -41,6 +41,7 @@ echo "Integration VM IP resolved: $INTEGRATION_IP"
 cat > "$APP_DIR/.env" << ENVEOF
 ELASTIC_OTLP_ENDPOINT=${elastic_otlp_endpoint}
 ELASTIC_API_KEY=${elastic_api_key}
+ELASTIC_APM_URL=${elastic_apm_url}
 INTEGRATION_VM_IP=$INTEGRATION_IP
 ENVEOF
 chmod 600 "$APP_DIR/.env"
@@ -70,6 +71,7 @@ services:
     environment:
       - OTLP_ENDPOINT=http://otel-collector:4317
       - MULESOFT_URL=http://$${INTEGRATION_VM_IP}:8081
+      - ELASTIC_APM_URL=$${ELASTIC_APM_URL}
     depends_on:
       - otel-collector
     restart: unless-stopped

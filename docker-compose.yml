@@ -38,6 +38,7 @@ services:
     environment:
       - OTLP_ENDPOINT=http://otel-collector:4317
       - MULESOFT_URL=http://mulesoft-proxy:8081
+      - ELASTIC_APM_URL=${ELASTIC_APM_URL:-}
     depends_on:
       - otel-collector
       - mulesoft-proxy

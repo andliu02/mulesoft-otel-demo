@@ -42,6 +42,7 @@ from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
 
 OTLP_ENDPOINT   = os.getenv("OTLP_ENDPOINT",   "http://otel-collector:4317")
 MULESOFT_URL    = os.getenv("MULESOFT_URL",     "http://integration-vm:8081")
+ELASTIC_APM_URL = os.getenv("ELASTIC_APM_URL",  "https://mulesoft-otel-demo-55170e.apm.us-central1.gcp.cloud.es.io")
 
 resource = Resource.create({
     "service.name": "fnb-portal",
@@ -263,47 +264,298 @@ def reconciliation_status():
 def health():
     return jsonify({"status": "UP", "service": "fnb-portal", "version": "4.2.1"})
 
-# ── Simple status UI ────────────────────────────────────────────────────────
+# ── Interactive Portal UI with Elastic RUM Agent ───────────────────────────
 PORTAL_UI = """<!DOCTYPE html>
 <html>
 <head>
   <title>First National Bank — Internal Portal</title>
   <style>
-    body { font-family: Arial, sans-serif; background: #1a2744; color: #fff; padding: 40px; }
-    h1 { color: #c8a96e; } h2 { color: #8ab4d4; font-size: 14px; }
-    .card { background: #243060; border-radius: 8px; padding: 20px; margin: 10px 0; }
-    .status { color: #4caf50; font-weight: bold; }
-    table { width: 100%; border-collapse: collapse; }
-    td { padding: 8px; border-bottom: 1px solid #344070; font-size: 13px; }
-    .badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; }
-    .green { background: #1b5e20; } .blue { background: #0d47a1; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #0f1b33; color: #e0e6f0; }
+    .topbar { background: #162040; padding: 12px 40px; display: flex; align-items: center;
+              border-bottom: 2px solid #c8a96e; }
+    .topbar h1 { color: #c8a96e; font-size: 18px; flex: 1; }
+    .topbar .user { color: #8ab4d4; font-size: 13px; }
+    .container { display: grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 50px); }
+    .sidebar { background: #162040; padding: 20px 0; }
+    .sidebar a { display: block; padding: 10px 24px; color: #8ab4d4; text-decoration: none;
+                 font-size: 13px; border-left: 3px solid transparent; }
+    .sidebar a:hover, .sidebar a.active { background: #1d2d55; color: #fff; border-left-color: #c8a96e; }
+    .main { padding: 30px; }
+    h2 { color: #c8a96e; font-size: 16px; margin-bottom: 16px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 30px; }
+    .card { background: #1a2744; border-radius: 8px; padding: 18px; border: 1px solid #2a3a60; }
+    .card .label { color: #7a8aaa; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+    .card .value { color: #fff; font-size: 28px; font-weight: 700; margin: 6px 0; }
+    .card .sub { color: #4caf50; font-size: 12px; }
+    .section { background: #1a2744; border-radius: 8px; padding: 24px; margin-bottom: 24px; border: 1px solid #2a3a60; }
+    .form-row { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+    .form-row label { color: #7a8aaa; font-size: 12px; display: block; margin-bottom: 4px; }
+    .form-row input, .form-row select { background: #0f1b33; border: 1px solid #2a3a60; color: #fff;
+      padding: 8px 12px; border-radius: 4px; font-size: 13px; width: 180px; }
+    .btn { padding: 9px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 600; }
+    .btn-primary { background: #c8a96e; color: #0f1b33; }
+    .btn-secondary { background: #2a3a60; color: #8ab4d4; }
+    .btn:hover { opacity: 0.85; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .status-dot { color: #4caf50; }
+    .status-row { display: flex; justify-content: space-between; padding: 8px 0;
+                  border-bottom: 1px solid #2a3a60; font-size: 13px; }
+    .result { margin-top: 12px; padding: 12px; background: #0f1b33; border-radius: 4px;
+              font-family: monospace; font-size: 12px; max-height: 200px; overflow-y: auto;
+              white-space: pre-wrap; display: none; }
+    .result.show { display: block; }
+    .result.error { border-left: 3px solid #f44336; }
+    .result.success { border-left: 3px solid #4caf50; }
+    .badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; background: #0d47a1; }
   </style>
 </head>
 <body>
-  <h1>🏦 First National Bank — Internal Operations Portal</h1>
-  <div class="card">
-    <h2>SYSTEM STATUS</h2>
-    <table>
-      <tr><td>MuleSoft Integration Platform</td><td><span class="status">● OPERATIONAL</span></td></tr>
-      <tr><td>Core Banking (Temenos T24)</td><td><span class="status">● OPERATIONAL</span></td></tr>
-      <tr><td>Fraud Detection (FICO Falcon)</td><td><span class="status">● OPERATIONAL</span></td></tr>
-      <tr><td>AML Screening (Dow Jones RC)</td><td><span class="status">● OPERATIONAL</span></td></tr>
-      <tr><td>CRM (Salesforce FSC)</td><td><span class="status">● OPERATIONAL</span></td></tr>
-      <tr><td>Notification Gateway</td><td><span class="status">● OPERATIONAL</span></td></tr>
-    </table>
+  <div class="topbar">
+    <h1>First National Bank — Internal Operations Portal</h1>
+    <div class="user">Teller: TLR-{{TELLER_ID}} | Branch: BR-001</div>
   </div>
-  <div class="card">
-    <h2>OBSERVABILITY</h2>
-    <p>All services instrumented with <span class="badge blue">EDOT Java (MuleSoft)</span>
-    and <span class="badge blue">OpenTelemetry</span> — traces, metrics, and logs
-    streaming to <strong>Elastic Cloud</strong>.</p>
+  <div class="container">
+    <div class="sidebar">
+      <a href="#" class="active" onclick="showTab('dashboard')">Dashboard</a>
+      <a href="#" onclick="showTab('wire')">Wire Transfer</a>
+      <a href="#" onclick="showTab('ach')">ACH Payment</a>
+      <a href="#" onclick="showTab('customer')">Customer 360</a>
+      <a href="#" onclick="showTab('account')">Open Account</a>
+      <a href="#" onclick="showTab('status')">System Status</a>
+    </div>
+    <div class="main">
+
+      <!-- Dashboard Tab -->
+      <div id="tab-dashboard" class="tab">
+        <h2>Operations Dashboard</h2>
+        <div class="cards">
+          <div class="card"><div class="label">Wire Transfers Today</div><div class="value" id="stat-wire">—</div><div class="sub">Processing</div></div>
+          <div class="card"><div class="label">ACH Payments</div><div class="value" id="stat-ach">—</div><div class="sub">Settled</div></div>
+          <div class="card"><div class="label">Customer Lookups</div><div class="value" id="stat-lookup">—</div><div class="sub">Completed</div></div>
+          <div class="card"><div class="label">Accounts Opened</div><div class="value" id="stat-acct">—</div><div class="sub">This session</div></div>
+        </div>
+        <div class="section">
+          <h2>Quick Actions</h2>
+          <div class="form-row">
+            <button class="btn btn-primary" onclick="showTab('wire')">New Wire Transfer</button>
+            <button class="btn btn-secondary" onclick="showTab('ach')">New ACH Payment</button>
+            <button class="btn btn-secondary" onclick="showTab('customer')">Customer Lookup</button>
+            <button class="btn btn-secondary" onclick="showTab('account')">Open Account</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Wire Transfer Tab -->
+      <div id="tab-wire" class="tab" style="display:none">
+        <h2>Initiate Wire Transfer</h2>
+        <div class="section">
+          <div class="form-row">
+            <div><label>Source Account</label><input id="wire-src" placeholder="ACC00000001"></div>
+            <div><label>Destination Account</label><input id="wire-dst" placeholder="EXT12345678"></div>
+            <div><label>Amount (USD)</label><input id="wire-amt" type="number" placeholder="10000.00"></div>
+          </div>
+          <div class="form-row">
+            <div><label>Currency</label><select id="wire-ccy"><option>USD</option><option>EUR</option><option>GBP</option></select></div>
+            <div><label>Destination Country</label><select id="wire-country"><option>US</option><option>GB</option><option>DE</option><option>SG</option><option>JP</option></select></div>
+            <div><label>Purpose</label><select id="wire-purpose"><option>TRADE</option><option>INVESTMENT</option><option>PERSONAL</option><option>PAYROLL</option></select></div>
+          </div>
+          <button class="btn btn-primary" id="wire-btn" onclick="submitWire()">Submit Wire Transfer</button>
+          <div id="wire-result" class="result"></div>
+        </div>
+      </div>
+
+      <!-- ACH Payment Tab -->
+      <div id="tab-ach" class="tab" style="display:none">
+        <h2>Initiate ACH Payment</h2>
+        <div class="section">
+          <div class="form-row">
+            <div><label>Source Account</label><input id="ach-src" placeholder="ACC00000001"></div>
+            <div><label>Routing Number</label><input id="ach-routing" placeholder="021000021"></div>
+            <div><label>Destination Account</label><input id="ach-dst" placeholder="12345678"></div>
+          </div>
+          <div class="form-row">
+            <div><label>Amount (USD)</label><input id="ach-amt" type="number" placeholder="500.00"></div>
+            <div><label>SEC Code</label><select id="ach-sec"><option>PPD</option><option>CCD</option><option>CTX</option></select></div>
+          </div>
+          <button class="btn btn-primary" id="ach-btn" onclick="submitACH()">Submit ACH Payment</button>
+          <div id="ach-result" class="result"></div>
+        </div>
+      </div>
+
+      <!-- Customer 360 Tab -->
+      <div id="tab-customer" class="tab" style="display:none">
+        <h2>Customer 360 Lookup</h2>
+        <div class="section">
+          <div class="form-row">
+            <div><label>Customer ID</label><input id="cust-id" placeholder="CUST000001"></div>
+            <button class="btn btn-primary" id="cust-btn" onclick="lookupCustomer()" style="align-self:end">Search</button>
+          </div>
+          <div id="cust-result" class="result"></div>
+        </div>
+      </div>
+
+      <!-- Open Account Tab -->
+      <div id="tab-account" class="tab" style="display:none">
+        <h2>Open New Account</h2>
+        <div class="section">
+          <div class="form-row">
+            <div><label>First Name</label><input id="acct-fname" placeholder="James"></div>
+            <div><label>Last Name</label><input id="acct-lname" placeholder="Smith"></div>
+            <div><label>Date of Birth</label><input id="acct-dob" type="date"></div>
+          </div>
+          <div class="form-row">
+            <div><label>Account Type</label><select id="acct-type"><option>CHECKING</option><option>SAVINGS</option></select></div>
+            <div><label>Initial Deposit (USD)</label><input id="acct-deposit" type="number" placeholder="1000.00"></div>
+          </div>
+          <button class="btn btn-primary" id="acct-btn" onclick="openAccount()">Open Account</button>
+          <div id="acct-result" class="result"></div>
+        </div>
+      </div>
+
+      <!-- System Status Tab -->
+      <div id="tab-status" class="tab" style="display:none">
+        <h2>System Status</h2>
+        <div class="section">
+          <div class="status-row"><span>MuleSoft Integration Platform</span><span class="status-dot">● OPERATIONAL</span></div>
+          <div class="status-row"><span>Core Banking (Temenos T24)</span><span class="status-dot">● OPERATIONAL</span></div>
+          <div class="status-row"><span>Fraud Detection (FICO Falcon)</span><span class="status-dot">● OPERATIONAL</span></div>
+          <div class="status-row"><span>AML Screening (Dow Jones RC)</span><span class="status-dot">● OPERATIONAL</span></div>
+          <div class="status-row"><span>CRM (Salesforce FSC)</span><span class="status-dot">● OPERATIONAL</span></div>
+          <div class="status-row"><span>Notification Gateway</span><span class="status-dot">● OPERATIONAL</span></div>
+        </div>
+        <div class="section">
+          <h2>Observability</h2>
+          <p>All services instrumented with <span class="badge">EDOT Java (MuleSoft)</span>
+          and <span class="badge">OpenTelemetry</span> — traces, metrics, and logs
+          streaming to <strong>Elastic Cloud</strong>.</p>
+          <p style="margin-top:8px">RUM agent active — capturing page loads, user interactions, and web vitals.</p>
+        </div>
+      </div>
+
+    </div>
   </div>
+
+  <!-- Elastic APM RUM Agent -->
+  <script src="https://unpkg.com/@elastic/apm-rum@5/dist/bundles/elastic-apm-rum.umd.min.js" crossorigin></script>
+  <script>
+    var apmServerUrl = '{{APM_SERVER_URL}}';
+    if (apmServerUrl) {
+      var apm = elasticApm.init({
+        serviceName: 'fnb-portal-rum',
+        serverUrl: apmServerUrl,
+        serviceVersion: '4.2.1',
+        environment: 'production',
+        distributedTracingOrigins: [window.location.origin],
+        transactionSampleRate: 1.0,
+        captureBody: 'all',
+      });
+    }
+
+    var stats = { wire: 0, ach: 0, lookup: 0, acct: 0 };
+
+    function showTab(name) {
+      document.querySelectorAll('.tab').forEach(t => t.style.display = 'none');
+      document.getElementById('tab-' + name).style.display = 'block';
+      document.querySelectorAll('.sidebar a').forEach(a => a.classList.remove('active'));
+      event.target.classList.add('active');
+    }
+
+    function showResult(id, data, isError) {
+      var el = document.getElementById(id);
+      el.textContent = JSON.stringify(data, null, 2);
+      el.className = 'result show ' + (isError ? 'error' : 'success');
+    }
+
+    async function submitWire() {
+      var btn = document.getElementById('wire-btn');
+      btn.disabled = true; btn.textContent = 'Processing...';
+      try {
+        var resp = await fetch('/portal/payments/wire', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({
+            sourceAccount: document.getElementById('wire-src').value || 'ACC00000001',
+            destinationAccount: document.getElementById('wire-dst').value || 'EXT' + Math.floor(Math.random()*90000000+10000000),
+            amount: parseFloat(document.getElementById('wire-amt').value) || Math.round(Math.random()*100000),
+            currency: document.getElementById('wire-ccy').value,
+            destinationCountry: document.getElementById('wire-country').value,
+            purpose: document.getElementById('wire-purpose').value,
+          })
+        });
+        var data = await resp.json();
+        showResult('wire-result', data, resp.status >= 400);
+        stats.wire++; document.getElementById('stat-wire').textContent = stats.wire;
+      } catch(e) { showResult('wire-result', {error: e.message}, true); }
+      btn.disabled = false; btn.textContent = 'Submit Wire Transfer';
+    }
+
+    async function submitACH() {
+      var btn = document.getElementById('ach-btn');
+      btn.disabled = true; btn.textContent = 'Processing...';
+      try {
+        var resp = await fetch('/portal/payments/ach', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({
+            sourceAccount: document.getElementById('ach-src').value || 'ACC00000001',
+            destinationRouting: document.getElementById('ach-routing').value || '021000021',
+            destinationAccount: document.getElementById('ach-dst').value || '12345678',
+            amount: parseFloat(document.getElementById('ach-amt').value) || Math.round(Math.random()*5000),
+            currency: 'USD',
+            secCode: document.getElementById('ach-sec').value,
+          })
+        });
+        var data = await resp.json();
+        showResult('ach-result', data, resp.status >= 400);
+        stats.ach++; document.getElementById('stat-ach').textContent = stats.ach;
+      } catch(e) { showResult('ach-result', {error: e.message}, true); }
+      btn.disabled = false; btn.textContent = 'Submit ACH Payment';
+    }
+
+    async function lookupCustomer() {
+      var btn = document.getElementById('cust-btn');
+      btn.disabled = true; btn.textContent = 'Searching...';
+      try {
+        var custId = document.getElementById('cust-id').value || 'CUST000001';
+        var resp = await fetch('/portal/customers/' + custId + '/360');
+        var data = await resp.json();
+        showResult('cust-result', data, resp.status >= 400);
+        stats.lookup++; document.getElementById('stat-lookup').textContent = stats.lookup;
+      } catch(e) { showResult('cust-result', {error: e.message}, true); }
+      btn.disabled = false; btn.textContent = 'Search';
+    }
+
+    async function openAccount() {
+      var btn = document.getElementById('acct-btn');
+      btn.disabled = true; btn.textContent = 'Processing...';
+      try {
+        var resp = await fetch('/portal/accounts/open', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({
+            firstName: document.getElementById('acct-fname').value || 'James',
+            lastName: document.getElementById('acct-lname').value || 'Smith',
+            dateOfBirth: document.getElementById('acct-dob').value || '1990-01-15',
+            accountType: document.getElementById('acct-type').value,
+            initialDeposit: parseFloat(document.getElementById('acct-deposit').value) || 1000,
+            branchCode: 'BR001',
+            customerType: 'INDIVIDUAL',
+          })
+        });
+        var data = await resp.json();
+        showResult('acct-result', data, resp.status >= 400);
+        stats.acct++; document.getElementById('stat-acct').textContent = stats.acct;
+      } catch(e) { showResult('acct-result', {error: e.message}, true); }
+      btn.disabled = false; btn.textContent = 'Open Account';
+    }
+  </script>
 </body>
 </html>"""
 
 @app.route("/")
 def ui():
-    return PORTAL_UI
+    teller_id = random.randint(100, 999)
+    html = PORTAL_UI.replace("{{TELLER_ID}}", str(teller_id))
+    html = html.replace("{{APM_SERVER_URL}}", ELASTIC_APM_URL)
+    return html
 
 # ── Burst Load Generator ────────────────────────────────────────────────────
 ACCOUNTS = [f"ACC{i:08d}" for i in range(1, 101)]

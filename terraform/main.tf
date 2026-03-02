@@ -174,6 +174,7 @@ resource "google_compute_instance" "app_vm" {
   metadata_startup_script = templatefile("${path.module}/startup-app-vm.sh.tpl", {
     elastic_otlp_endpoint = var.elastic_otlp_endpoint
     elastic_api_key       = var.elastic_api_key
+    elastic_apm_url       = var.elastic_apm_url
     integration_vm_ip     = ""   # populated post-boot via internal DNS
   })
 }

@@ -2,7 +2,7 @@
 """
 Create Kibana dashboards for the FNB MuleSoft OTel Demo.
 
-Builds 13 dashboards via the Kibana Saved Objects API:
+Builds 14 dashboards + 8 alert rules via the Kibana API:
   Phase 1 (Pure MuleSoft Metrics — EDOT out of the box):
     1. MuleSoft Runtime Metrics
   Phase 2 (OTel with MuleSoft — adding OTel instrumentation to MuleSoft):
@@ -14,6 +14,7 @@ Builds 13 dashboards via the Kibana Saved Objects API:
     3. Core Banking — Database Performance
     5. Operations Command Center
     7, 9-13. Individual service dashboards
+    14. RUM — End-User Experience
 
 Usage:
     python create_dashboards.py --kibana-url <URL> --api-key <KEY>
@@ -32,6 +33,7 @@ import requests as http_requests
 METRICS_INDEX = "metrics-*"
 TRACES_INDEX = "traces-*"
 LOGS_INDEX = "logs-*"
+RUM_INDEX = "traces-apm*"
 
 
 class KibanaClient:
@@ -71,6 +73,17 @@ class KibanaClient:
         else:
             self.errors += 1
             print(f"    ERROR {obj_type}/{obj_id}: {resp.status_code} {resp.text[:200]}")
+        return resp
+
+    def create_rule(self, rule_id, body):
+        """Create or replace a Kibana alerting rule."""
+        self._request("DELETE", f"/api/alerting/rule/{rule_id}")
+        resp = self._request("POST", f"/api/alerting/rule/{rule_id}", body)
+        if resp.status_code in (200, 201):
+            self.created += 1
+        else:
+            self.errors += 1
+            print(f"    ERROR rule/{rule_id}: {resp.status_code} {resp.text[:200]}")
         return resp
 
 
@@ -118,6 +131,16 @@ FIELD_LABELS = {
     # Logs
     "log.level":              "Log Level",
     "@timestamp":             "Timestamp",
+    # RUM
+    "transaction.type":           "Transaction Type",
+    "transaction.name":           "Page / Route",
+    "transaction.duration.us":    "Duration",
+    "transaction.result":         "Result",
+    "user_agent.name":            "Browser",
+    "user_agent.os.name":         "OS",
+    "url.path":                   "URL Path",
+    "http.response.status_code":  "Status Code",
+    "client.geo.country_name":    "Country",
 }
 
 
@@ -966,6 +989,157 @@ def build_d13(c):
          (f"{p}vol",      "lens", 0,  50, 48, 14)])
 
 
+# ─── Dashboard 14: RUM — End-User Experience ─────────────────────────────────
+
+def build_d14(c):
+    p = "fnb-rum-"
+    dv = "rum-apm"
+    pl = 'transaction.type: "page-load"'
+    print("  Creating visualizations...")
+
+    # Metric tiles
+    lens_metric(c, f"{p}loads", "Page Loads", "transaction.duration.us", agg="count",
+                dv=dv, subtitle="Total", query=pl)
+    _formula_metric(c, f"{p}avg", "Avg Page Load",
+                    "average(transaction.duration.us) / 1000", dv=dv, subtitle="ms", query=pl)
+    _formula_metric(c, f"{p}p95", "P95 Page Load",
+                    "percentile(transaction.duration.us, 95) / 1000", dv=dv, subtitle="ms", query=pl)
+    lens_metric(c, f"{p}browsers", "Unique Browsers", "user_agent.name", agg="unique_count",
+                dv=dv, subtitle="Agents")
+
+    # Time series
+    _formula_xy(c, f"{p}load-t", "Page Load Time Over Time (ms)",
+                "average(transaction.duration.us) / 1000", chart="line",
+                dv=dv, ylabel="Avg Load Time (ms)", query=pl)
+    lens_xy(c, f"{p}vol-t", "Page Load Volume Over Time",
+            "transaction.duration.us", agg="count", chart="bar",
+            split="transaction.name", dv=dv, ylabel="Page Loads", query=pl)
+    _formula_xy(c, f"{p}perc-t", "Page Load Percentiles Over Time (ms)",
+                "percentile(transaction.duration.us, 95) / 1000", chart="area",
+                dv=dv, ylabel="P95 Load Time (ms)", query=pl)
+
+    # Breakdowns
+    lens_pie(c, f"{p}browser-pie", "Page Loads by Browser",
+             "transaction.duration.us", "user_agent.name", agg="count", dv=dv, query=pl)
+    lens_pie(c, f"{p}os-pie", "Page Loads by OS",
+             "transaction.duration.us", "user_agent.os.name", agg="count", dv=dv, query=pl)
+    lens_pie(c, f"{p}page-pie", "Time Spent by Page",
+             "transaction.duration.us", "transaction.name", dv=dv, query=pl)
+    lens_pie(c, f"{p}result-pie", "Results Distribution",
+             "transaction.duration.us", "transaction.result", agg="count", dv=dv)
+
+    # Table: slowest pages
+    lens_table(c, f"{p}slow", "Slowest Pages",
+               [("transaction.name", "Page", "terms"),
+                ("user_agent.name", "Browser", "terms"),
+                ("formula:max(transaction.duration.us) / 1000", "Max Load (ms)", "formula")],
+               dv=dv, query=pl)
+
+    print("  Creating dashboard...")
+    dashboard(c, "fnb-dashboard-rum",
+        "[FNB] Phase 3: RUM — End-User Experience",
+        "Real User Monitoring: page load performance, browser breakdown, and user experience from the FNB Portal.",
+        [(f"{p}loads",      "lens", 0,  0,  12, 8),
+         (f"{p}avg",        "lens", 12, 0,  12, 8),
+         (f"{p}p95",        "lens", 24, 0,  12, 8),
+         (f"{p}browsers",   "lens", 36, 0,  12, 8),
+         (f"{p}load-t",     "lens", 0,  8,  48, 14),
+         (f"{p}vol-t",      "lens", 0,  22, 24, 14),
+         (f"{p}perc-t",     "lens", 24, 22, 24, 14),
+         (f"{p}browser-pie","lens", 0,  36, 16, 14),
+         (f"{p}os-pie",     "lens", 16, 36, 16, 14),
+         (f"{p}page-pie",   "lens", 32, 36, 16, 14),
+         (f"{p}result-pie", "lens", 0,  50, 24, 14),
+         (f"{p}slow",       "lens", 24, 50, 24, 14)])
+
+
+# ─── Alerting Rules ──────────────────────────────────────────────────────────
+
+def _es_rule(name, index, query_dsl, threshold=1, comparator=">=",
+             window=5, tags=None):
+    """Build an Elasticsearch query alert rule body."""
+    return {
+        "rule_type_id": ".es-query",
+        "consumer": "stackAlerts",
+        "name": name,
+        "enabled": True,
+        "schedule": {"interval": "1m"},
+        "params": {
+            "searchType": "esQuery",
+            "index": [index],
+            "timeField": "@timestamp",
+            "esQuery": json.dumps({"query": query_dsl}),
+            "threshold": [threshold],
+            "thresholdComparator": comparator,
+            "timeWindowSize": window,
+            "timeWindowUnit": "m",
+            "size": 100,
+        },
+        "actions": [],
+        "tags": tags or [],
+    }
+
+
+def build_alerts(c):
+    print("  Creating alert rules...")
+
+    alerts = [
+        # Phase 1: MuleSoft
+        ("fnb-alert-mule-call-errors",
+         _es_rule("[FNB] MuleSoft Integration Call Errors",
+                  METRICS_INDEX,
+                  {"range": {"portal.mulesoft.errors": {"gt": 0}}},
+                  threshold=1, tags=["fnb-demo", "phase-1", "mulesoft"])),
+
+        # Phase 2: OTel + MuleSoft
+        ("fnb-alert-high-latency",
+         _es_rule("[FNB] High Span Latency (> 3s)",
+                  TRACES_INDEX,
+                  {"range": {"span.duration.us": {"gt": 3000000}}},
+                  threshold=1, tags=["fnb-demo", "phase-2", "latency"])),
+
+        ("fnb-alert-error-outcomes",
+         _es_rule("[FNB] Trace Error Outcome Spike",
+                  TRACES_INDEX,
+                  {"term": {"event.outcome": "failure"}},
+                  threshold=5, tags=["fnb-demo", "phase-2", "tracing"])),
+
+        # Phase 3: All applications
+        ("fnb-alert-slow-queries",
+         _es_rule("[FNB] Slow DB Queries Detected",
+                  METRICS_INDEX,
+                  {"range": {"db.slow_queries.total": {"gt": 0}}},
+                  threshold=1, tags=["fnb-demo", "phase-3", "core-banking"])),
+
+        ("fnb-alert-portal-errors",
+         _es_rule("[FNB] Portal Error Spike",
+                  METRICS_INDEX,
+                  {"range": {"portal.errors.total": {"gt": 5}}},
+                  threshold=3, tags=["fnb-demo", "phase-3", "portal"])),
+
+        ("fnb-alert-fraud-flagged",
+         _es_rule("[FNB] Fraud Transactions Flagged",
+                  METRICS_INDEX,
+                  {"range": {"fraud.flags.total": {"gt": 0}}},
+                  threshold=1, tags=["fnb-demo", "phase-3", "fraud"])),
+
+        ("fnb-alert-notification-failures",
+         _es_rule("[FNB] Notification Delivery Failures",
+                  METRICS_INDEX,
+                  {"range": {"notification.failed.total": {"gt": 0}}},
+                  threshold=1, tags=["fnb-demo", "phase-3", "notification"])),
+
+        ("fnb-alert-aml-watchlist",
+         _es_rule("[FNB] AML Watchlist Hit",
+                  METRICS_INDEX,
+                  {"range": {"aml.hits.total": {"gt": 0}}},
+                  threshold=1, tags=["fnb-demo", "phase-3", "aml"])),
+    ]
+
+    for rule_id, body in alerts:
+        c.create_rule(rule_id, body)
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -985,6 +1159,7 @@ def main():
     c.create_data_view("metrics-otel", METRICS_INDEX)
     c.create_data_view("traces-otel", TRACES_INDEX)
     c.create_data_view("logs-otel", LOGS_INDEX)
+    c.create_data_view("rum-apm", RUM_INDEX)
 
     for i, (name, fn) in enumerate([
         ("MuleSoft Integration — Runtime Metrics", build_d1),
@@ -1000,9 +1175,13 @@ def main():
         ("AML Screening Service", build_d11),
         ("Customer Profile (CRM) Service", build_d12),
         ("Notification Service", build_d13),
+        ("RUM — End-User Experience", build_d14),
     ], 1):
         print(f"\n{i+1}. Building: {name}")
         fn(c)
+
+    print(f"\n{i+2}. Building: Alert Rules")
+    build_alerts(c)
 
     print(f"\n{'='*60}")
     print(f"Created {c.created} objects, {c.errors} errors")
@@ -1024,6 +1203,7 @@ def main():
         ("fnb-dashboard-aml",              "[Phase 3] AML Screening"),
         ("fnb-dashboard-crm",              "[Phase 3] Customer Profile (CRM)"),
         ("fnb-dashboard-notification",      "[Phase 3] Notification"),
+        ("fnb-dashboard-rum",               "[Phase 3] RUM — End-User Experience"),
     ]:
         print(f"  {name}")
         print(f"    {base}/app/dashboards#/view/{did}")

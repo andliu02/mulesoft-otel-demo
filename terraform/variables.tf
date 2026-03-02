@@ -39,6 +39,12 @@ variable "allowed_demo_cidr" {
   default     = "0.0.0.0/0"
 }
 
+variable "elastic_apm_url" {
+  description = "Elastic APM server URL for RUM agent"
+  type        = string
+  default     = "https://mulesoft-otel-demo-55170e.apm.us-central1.gcp.cloud.es.io"
+}
+
 variable "use_preemptible" {
   description = "Use preemptible (spot) VMs to save cost"
   type        = bool
