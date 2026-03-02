@@ -147,13 +147,25 @@ def initiate_wire_transfer():
     portal_requests.add(1, {"portal.operation": "wire_transfer"})
     logger.info(f"Wire transfer initiated | amount={amount:.2f} from={body.get('sourceAccount')} correlationId={correlation_id}")
 
+    source_account = body.get("sourceAccount", "ACC00000001")
+    # Derive customer ID from account number (ACC00000042 → CUST000042)
+    try:
+        acct_num = int(source_account.replace("ACC", ""))
+        customer_id = f"CUST{acct_num:06d}"
+    except ValueError:
+        customer_id = "CUST000001"
+
     with tracer.start_as_current_span("portal.initiateWireTransfer",
         attributes={
             "portal.operation": "wire_transfer",
+            "customer.id": customer_id,
             "payment.amount": amount,
             "payment.currency": body.get("currency", "USD"),
-            "payment.source_account": body.get("sourceAccount", ""),
-            "payment.destination": body.get("destinationAccount", ""),
+            "payment.source_account": source_account,
+            "payment.destination_account": body.get("destinationAccount", ""),
+            "payment.destination_country": body.get("destinationCountry", "US"),
+            "payment.purpose": body.get("purpose", "TRADE"),
+            "payment.type": "WIRE",
             "portal.correlation_id": correlation_id,
         }):
 
@@ -205,6 +217,11 @@ def open_account():
         attributes={
             "portal.operation": "account_opening",
             "account.type": body.get("accountType", "CHECKING"),
+            "account.initial_deposit": body.get("initialDeposit", 0),
+            "customer.first_name": body.get("firstName", ""),
+            "customer.last_name": body.get("lastName", ""),
+            "customer.type": body.get("customerType", "INDIVIDUAL"),
+            "customer.branch_code": body.get("branchCode", "BR001"),
         }):
 
         start = time.time()
@@ -229,8 +246,25 @@ def initiate_ach():
     amount = body.get("amount", random.uniform(50, 10000))
     portal_requests.add(1, {"portal.operation": "ach_payment"})
 
+    source_account = body.get("sourceAccount", "ACC00000001")
+    try:
+        acct_num = int(source_account.replace("ACC", ""))
+        customer_id = f"CUST{acct_num:06d}"
+    except ValueError:
+        customer_id = "CUST000001"
+
     with tracer.start_as_current_span("portal.initiateACH",
-        attributes={"portal.operation": "ach_payment", "payment.amount": amount}):
+        attributes={
+            "portal.operation": "ach_payment",
+            "customer.id": customer_id,
+            "payment.amount": amount,
+            "payment.currency": "USD",
+            "payment.source_account": source_account,
+            "payment.destination_account": body.get("destinationAccount", ""),
+            "payment.destination_routing": body.get("destinationRouting", ""),
+            "payment.type": "ACH",
+            "payment.sec_code": body.get("secCode", "PPD"),
+        }):
 
         start = time.time()
         result = call_mulesoft("/api/payments/ach", method="POST",
@@ -574,11 +608,12 @@ def get_request_interval():
         return random.uniform(5.0, 12.0)
 
 def generate_wire_transfer():
+    source_acct = random.choice(ACCOUNTS)
     requests.post("http://localhost:8080/portal/payments/wire", json={
-        "sourceAccount": random.choice(ACCOUNTS),
+        "sourceAccount": source_acct,
         "destinationAccount": f"EXT{random.randint(10000000,99999999)}",
         "amount": round(random.uniform(1000, 250000), 2),
-        "currency": "USD",
+        "currency": random.choice(["USD", "USD", "USD", "EUR", "GBP"]),
         "paymentType": "WIRE",
         "destinationCountry": random.choice(["US", "GB", "DE", "SG", "JP", "CA"]),
         "purpose": random.choice(["TRADE", "INVESTMENT", "PERSONAL", "PAYROLL"]),

@@ -2,7 +2,7 @@
 """
 Create Kibana dashboards for the FNB MuleSoft OTel Demo.
 
-Builds 14 dashboards + 8 alert rules via the Kibana API:
+Builds 15 dashboards + 8 alert rules via the Kibana API:
   Phase 1 (Pure MuleSoft Metrics — EDOT out of the box):
     1. MuleSoft Runtime Metrics
   Phase 2 (OTel with MuleSoft — adding OTel instrumentation to MuleSoft):
@@ -15,6 +15,7 @@ Builds 14 dashboards + 8 alert rules via the Kibana API:
     5. Operations Command Center
     7, 9-13. Individual service dashboards
     14. RUM — End-User Experience
+    15. Customer & Business Intelligence
 
 Usage:
     python create_dashboards.py --kibana-url <URL> --api-key <KEY>
@@ -141,6 +142,18 @@ FIELD_LABELS = {
     "url.path":                   "URL Path",
     "http.response.status_code":  "Status Code",
     "client.geo.country_name":    "Country",
+    # Business / Customer
+    "customer.id":                    "Customer ID",
+    "payment.source_account":         "Source Account",
+    "payment.destination_account":    "Destination Account",
+    "payment.destination_country":    "Destination Country",
+    "payment.purpose":                "Purpose",
+    "payment.currency":               "Currency",
+    "payment.amount":                 "Amount (USD)",
+    "payment.type":                   "Payment Type",
+    "payment.sec_code":               "SEC Code",
+    "account.initial_deposit":        "Initial Deposit",
+    "customer.branch_code":           "Branch",
 }
 
 
@@ -1053,6 +1066,87 @@ def build_d14(c):
          (f"{p}slow",       "lens", 24, 50, 24, 14)])
 
 
+# ─── Dashboard 15: Customer & Business Intelligence ─────────────────────────
+
+def build_d15(c):
+    p = "fnb-biz-"
+    dv = "traces-otel"
+    # Filter to portal spans that carry business attributes
+    pq = 'customer.id: CUST* OR payment.type: *'
+    print("  Creating visualizations...")
+
+    # Row 1: KPI tiles
+    lens_metric(c, f"{p}txn-count", "Total Transactions", "span.duration.us",
+                agg="count", dv=dv, subtitle="Payment Spans",
+                query='payment.type: WIRE OR payment.type: ACH')
+    lens_metric(c, f"{p}customers", "Unique Customers", "customer.id",
+                agg="unique_count", dv=dv, subtitle="Distinct IDs",
+                query='customer.id: CUST*')
+    lens_metric(c, f"{p}accounts", "Unique Accounts", "payment.source_account",
+                agg="unique_count", dv=dv, subtitle="Source Accounts",
+                query='payment.source_account: ACC*')
+    _formula_metric(c, f"{p}avg-amt", "Avg Transaction Amount",
+                    "average(payment.amount)", dv=dv, subtitle="USD",
+                    query='payment.type: WIRE OR payment.type: ACH')
+
+    # Row 2: Transaction volume & value over time
+    lens_xy(c, f"{p}vol-time", "Transaction Volume Over Time",
+            "span.duration.us", agg="count", chart="bar_stacked",
+            split="payment.type", dv=dv, ylabel="Transactions",
+            query='payment.type: WIRE OR payment.type: ACH')
+    lens_xy(c, f"{p}amt-time", "Transaction Value Over Time (USD)",
+            "payment.amount", agg="sum", chart="area",
+            split="payment.type", dv=dv, ylabel="Total Amount (USD)",
+            query='payment.type: WIRE OR payment.type: ACH')
+
+    # Row 3: Customer & account breakdowns
+    lens_pie(c, f"{p}type-pie", "Transaction Mix (Wire vs ACH)",
+             "payment.amount", "payment.type", agg="sum", dv=dv,
+             query='payment.type: WIRE OR payment.type: ACH')
+    lens_pie(c, f"{p}ccy-pie", "Transactions by Currency",
+             "payment.amount", "payment.currency", agg="sum", dv=dv,
+             query='payment.type: WIRE OR payment.type: ACH')
+    lens_pie(c, f"{p}country-pie", "Wire Transfers by Destination Country",
+             "payment.amount", "payment.destination_country", agg="sum", dv=dv,
+             query='payment.type: WIRE')
+    lens_pie(c, f"{p}purpose-pie", "Wire Transfers by Purpose",
+             "payment.amount", "payment.purpose", agg="sum", dv=dv,
+             query='payment.type: WIRE')
+
+    # Row 4: Top customers table
+    lens_table(c, f"{p}top-cust", "Top Customers by Transaction Volume",
+               [("customer.id", "Customer ID", "terms"),
+                ("payment.source_account", "Account", "terms"),
+                ("payment.amount", "Total Amount (USD)", "sum"),
+                ("span.duration.us", "Txn Count", "count")],
+               dv=dv, query='payment.type: WIRE OR payment.type: ACH')
+
+    # Row 5: High-value transactions table
+    lens_table(c, f"{p}high-val", "High-Value Transactions (> $50K)",
+               [("customer.id", "Customer", "terms"),
+                ("payment.source_account", "Source Account", "terms"),
+                ("payment.type", "Type", "terms"),
+                ("payment.amount", "Max Amount (USD)", "max")],
+               dv=dv, query='payment.amount > 50000')
+
+    print("  Creating dashboard...")
+    dashboard(c, "fnb-dashboard-business",
+        "[FNB] Phase 3: Customer & Business Intelligence",
+        "Business-focused view: customer activity, transaction volumes, payment amounts, destination analysis, and high-value transaction monitoring.",
+        [(f"{p}txn-count",    "lens", 0,  0,  12, 8),
+         (f"{p}customers",    "lens", 12, 0,  12, 8),
+         (f"{p}accounts",     "lens", 24, 0,  12, 8),
+         (f"{p}avg-amt",      "lens", 36, 0,  12, 8),
+         (f"{p}vol-time",     "lens", 0,  8,  24, 14),
+         (f"{p}amt-time",     "lens", 24, 8,  24, 14),
+         (f"{p}type-pie",     "lens", 0,  22, 12, 14),
+         (f"{p}ccy-pie",      "lens", 12, 22, 12, 14),
+         (f"{p}country-pie",  "lens", 24, 22, 12, 14),
+         (f"{p}purpose-pie",  "lens", 36, 22, 12, 14),
+         (f"{p}top-cust",     "lens", 0,  36, 48, 16),
+         (f"{p}high-val",     "lens", 0,  52, 48, 16)])
+
+
 # ─── Alerting Rules ──────────────────────────────────────────────────────────
 
 def _es_rule(name, index, query_dsl, threshold=1, comparator=">=",
@@ -1176,6 +1270,7 @@ def main():
         ("Customer Profile (CRM) Service", build_d12),
         ("Notification Service", build_d13),
         ("RUM — End-User Experience", build_d14),
+        ("Customer & Business Intelligence", build_d15),
     ], 1):
         print(f"\n{i+1}. Building: {name}")
         fn(c)
@@ -1204,6 +1299,7 @@ def main():
         ("fnb-dashboard-crm",              "[Phase 3] Customer Profile (CRM)"),
         ("fnb-dashboard-notification",      "[Phase 3] Notification"),
         ("fnb-dashboard-rum",               "[Phase 3] RUM — End-User Experience"),
+        ("fnb-dashboard-business",          "[Phase 3] Customer & Business Intelligence"),
     ]:
         print(f"  {name}")
         print(f"    {base}/app/dashboards#/view/{did}")

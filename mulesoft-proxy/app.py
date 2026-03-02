@@ -163,18 +163,29 @@ def payment_processing_flow():
     flow_executions.add(1, {"mule.flow.name": "payment-processing-flow", "payment.type": payment_type})
     message_count.add(1, {"mule.flow.name": "payment-processing-flow"})
 
+    source_account = body.get("sourceAccount", f"ACC{random.randint(1,100):08d}")
+    # Derive customer ID from account number
+    try:
+        acct_num = int(source_account.replace("ACC", ""))
+        customer_id = f"CUST{acct_num:06d}"
+    except ValueError:
+        customer_id = f"CUST{random.randint(1,100):06d}"
+
     with tracer.start_as_current_span("mule:flow/payment-processing-flow",
         attributes={
             "mule.flow.name": "payment-processing-flow",
             "mule.app.name": "fnb-integration",
             "mule.correlation_id": correlation_id,
+            "customer.id": customer_id,
             "payment.type": payment_type,
             "payment.amount": amount,
             "payment.currency": body.get("currency", "USD"),
+            "payment.source_account": source_account,
+            "payment.destination_account": body.get("destinationAccount", ""),
+            "payment.destination_country": body.get("destinationCountry", "US"),
         }) as flow_span:
 
         start = time.time()
-        source_account = body.get("sourceAccount", f"ACC{random.randint(1,100):08d}")
 
         logger.info(f"Flow started | flow=payment-processing-flow type={payment_type} amount={amount:.2f} correlationId={correlation_id}")
 
@@ -285,6 +296,7 @@ def customer_360_flow(customer_id):
             "mule.app.name": "fnb-integration",
             "mule.correlation_id": correlation_id,
             "customer.id": customer_id,
+            "customer.account_id": f"ACC{customer_id.replace('CUST', ''):0>8}",
         }) as flow_span:
 
         start = time.time()
@@ -364,6 +376,10 @@ def account_opening_kyc_flow():
             "mule.app.name": "fnb-integration",
             "mule.correlation_id": correlation_id,
             "account.type": body.get("accountType", "CHECKING"),
+            "account.initial_deposit": body.get("initialDeposit", 0),
+            "customer.first_name": body.get("firstName", ""),
+            "customer.last_name": body.get("lastName", ""),
+            "customer.type": body.get("customerType", "INDIVIDUAL"),
         }) as flow_span:
 
         start = time.time()
