@@ -155,3 +155,17 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+
+  # ── RUM Load Generator (headless browser) ──────────────────────────────────
+  rum-loadgen:
+    build: ./rum-loadgen
+    environment:
+      - PORTAL_URL=http://fnb-portal:8080
+      - NUM_USERS=2
+      - MIN_INTERVAL=3
+      - MAX_INTERVAL=10
+      - STARTUP_DELAY=30
+    depends_on:
+      fnb-portal:
+        condition: service_healthy
+    restart: unless-stopped
