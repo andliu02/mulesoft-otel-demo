@@ -35,9 +35,9 @@ logger = logging.getLogger("rum-loadgen")
 
 ACCOUNTS = [f"ACC{i:08d}" for i in range(1, 101)]
 CUSTOMERS = [f"CUST{i:06d}" for i in range(1, 101)]
-COUNTRIES = ["US", "GB", "DE", "JP", "CA", "AU", "FR", "CH", "SG", "HK"]
-CURRENCIES = ["USD", "EUR", "GBP", "JPY", "CAD"]
-PURPOSES = ["TRADE_SETTLEMENT", "PAYROLL", "VENDOR_PAYMENT", "TREASURY", "INTERCOMPANY"]
+COUNTRIES = ["US", "GB", "DE", "SG", "JP"]
+CURRENCIES = ["USD", "EUR", "GBP"]
+PURPOSES = ["TRADE", "INVESTMENT", "PERSONAL", "PAYROLL"]
 SEC_CODES = ["PPD", "CCD", "CTX"]
 FIRST_NAMES = ["James", "Sarah", "Michael", "Emily", "Robert", "Lisa", "David", "Jennifer"]
 LAST_NAMES = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis"]
