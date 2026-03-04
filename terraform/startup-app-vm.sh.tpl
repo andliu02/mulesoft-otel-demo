@@ -29,7 +29,7 @@ echo "Docker: $(docker --version)"
 
 # ── App directory ────────────────────────────────────────────────────────────
 APP_DIR=/opt/fnb-mulesoft-otel-demo
-mkdir -p "$APP_DIR"/{fnb-portal,backend-services/{core-banking-svc,fraud-detection-svc,aml-screening-svc,customer-profile-svc,notification-svc},otel-collector}
+mkdir -p "$APP_DIR"/{fnb-portal,backend-services/{core-banking-svc,fraud-detection-svc,aml-screening-svc,customer-profile-svc,notification-svc},otel-collector,rum-loadgen}
 
 # ── Get internal IP for MULESOFT_URL ────────────────────────────────────────
 # integration-vm is on same subnet, use GCP internal DNS
@@ -192,6 +192,9 @@ cp /tmp/repo/otel-collector/otel-collector-config.yml "$APP_DIR/otel-collector/o
 # Copy MuleSoft proxy
 mkdir -p "$APP_DIR/mulesoft-proxy"
 cp -r /tmp/repo/mulesoft-proxy/* "$APP_DIR/mulesoft-proxy/"
+
+# Copy RUM load generator
+cp -r /tmp/repo/rum-loadgen/* "$APP_DIR/rum-loadgen/"
 
 # Copy docker-compose.yml from repo (overwrite the inline one)
 cp /tmp/repo/docker-compose.yml "$APP_DIR/docker-compose.yml"
