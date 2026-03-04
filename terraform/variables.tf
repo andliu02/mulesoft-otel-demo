@@ -48,7 +48,7 @@ variable "elastic_apm_url" {
 variable "use_preemptible" {
   description = "Use preemptible (spot) VMs to save cost"
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "owner_label" {

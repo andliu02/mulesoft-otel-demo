@@ -107,7 +107,7 @@ resource "google_compute_instance" "integration_vm" {
 
   service_account {
     email  = google_service_account.demo.email
-    scopes = ["cloud-platform"]
+    scopes = ["logging-write", "monitoring-write"]
   }
 
   scheduling {
@@ -155,7 +155,7 @@ resource "google_compute_instance" "app_vm" {
 
   service_account {
     email  = google_service_account.demo.email
-    scopes = ["cloud-platform"]
+    scopes = ["logging-write", "monitoring-write"]
   }
 
   scheduling {
