@@ -2,7 +2,7 @@
 """
 Create Kibana dashboards for the FNB MuleSoft OTel Demo.
 
-Builds 15 dashboards + 8 alert rules via the Kibana API:
+Builds 16 dashboards + 8 alert rules via the Kibana API:
   Phase 1 (Pure MuleSoft Metrics — EDOT out of the box):
     1. MuleSoft Runtime Metrics
   Phase 2 (OTel with MuleSoft — adding OTel instrumentation to MuleSoft):
@@ -1011,8 +1011,8 @@ def build_d14(c):
     print("  Creating visualizations...")
 
     # Metric tiles
-    lens_metric(c, f"{p}loads", "Page Loads", "transaction.duration.us", agg="count",
-                dv=dv, subtitle="Total", query=pl)
+    _formula_metric(c, f"{p}loads", "Page Loads",
+                    "count()", dv=dv, subtitle="Total", query=pl)
     _formula_metric(c, f"{p}avg", "Avg Page Load",
                     "average(transaction.duration.us) / 1000", dv=dv, subtitle="ms", query=pl)
     _formula_metric(c, f"{p}p95", "P95 Page Load",
@@ -1076,9 +1076,9 @@ def build_d15(c):
     print("  Creating visualizations...")
 
     # Row 1: KPI tiles
-    lens_metric(c, f"{p}txn-count", "Total Transactions", "span.duration.us",
-                agg="count", dv=dv, subtitle="Payment Spans",
-                query='payment.type: WIRE OR payment.type: ACH')
+    _formula_metric(c, f"{p}txn-count", "Total Transactions",
+                    "count()", dv=dv, subtitle="Payment Spans",
+                    query='payment.type: WIRE OR payment.type: ACH')
     lens_metric(c, f"{p}customers", "Unique Customers", "customer.id",
                 agg="unique_count", dv=dv, subtitle="Distinct IDs",
                 query='customer.id: CUST*')
@@ -1236,6 +1236,116 @@ def build_alerts(c):
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
+# ─── Dashboard 16: Service Health & Top Transactions ──────────────────────
+
+def build_d16(c):
+    """High-level operational dashboard: health of every service + top transactions."""
+    p = "fnb-h-"
+    dv = "traces-otel"
+    print("  Creating visualizations...")
+
+    # ── Header ──
+    markdown(c, f"{p}hdr", "Service Health Overview",
+        "# Service Health & Top Transactions\n\n"
+        "High-level operational view of every service in the FNB stack.\n"
+        "**Top row:** health KPIs per service. **Bottom:** slowest transactions per service.\n\n"
+        "---\n"
+        "*Filter by time range to focus on incidents. Click any service name to drill down.*")
+
+    # ── Per-service health tiles ──
+    # Each service gets: throughput (count), avg latency, error rate
+    services = [
+        ("fnb-portal",                "Portal",         "service.name: fnb-portal"),
+        ("mulesoft-anypoint-runtime",  "MuleSoft",       "service.name: mulesoft-anypoint-runtime"),
+        ("core-banking-svc",           "Core Banking",   "service.name: core-banking-svc"),
+        ("fraud-detection-svc",        "Fraud Detection", "service.name: fraud-detection-svc"),
+        ("aml-screening-svc",          "AML Screening",  "service.name: aml-screening-svc"),
+        ("customer-profile-svc",       "Customer CRM",   "service.name: customer-profile-svc"),
+        ("notification-svc",           "Notifications",  "service.name: notification-svc"),
+    ]
+
+    for svc_id, label, q in services:
+        sid = svc_id.replace("-", "")[:12]
+        # Throughput
+        _formula_metric(c, f"{p}{sid}-tp", f"{label} — Throughput",
+                        "count()", dv=dv, subtitle="Requests", query=q)
+        # Avg latency (ms)
+        _formula_metric(c, f"{p}{sid}-lat", f"{label} — Avg Latency",
+                        "average(span.duration.us) / 1000", dv=dv, subtitle="ms", query=q)
+        # Error rate (%)
+        _formula_metric(c, f"{p}{sid}-err", f"{label} — Error Rate",
+                        "count(kql='event.outcome: failure') / count() * 100",
+                        dv=dv, subtitle="% errors", query=q)
+
+    # ── MuleSoft Flow Health (time series) ──
+    _formula_xy(c, f"{p}mule-flow-ts", "MuleSoft Flow Throughput Over Time",
+                "count()", chart="bar_stacked", split="span.name", dv=dv,
+                ylabel="Requests",
+                query="service.name: mulesoft-anypoint-runtime AND span.name: mule\\:flow*")
+
+    # ── Error Rate Over Time by Service ──
+    _formula_xy(c, f"{p}err-ts", "Error Rate Over Time by Service",
+                "count(kql='event.outcome: failure') / count() * 100",
+                chart="line", split="service.name", dv=dv,
+                ylabel="Error %")
+
+    # ── Latency Over Time by Service ──
+    _formula_xy(c, f"{p}lat-ts", "Avg Latency Over Time by Service",
+                "average(span.duration.us) / 1000",
+                chart="line", split="service.name", dv=dv,
+                ylabel="ms")
+
+    # ── Top 5 Transactions tables per service ──
+    for svc_id, label, q in services:
+        sid = svc_id.replace("-", "")[:12]
+        lens_table(c, f"{p}{sid}-top", f"Top Transactions — {label}",
+                   [("span.name", "Transaction", "terms"),
+                    ("span.duration.us", "Avg Latency (us)", "average"),
+                    ("span.duration.us", "Max Latency (us)", "max"),
+                    ("@timestamp", "Count", "count")],
+                   dv=dv, query=q)
+
+    # ── Layout ──
+    panels = []
+    # Header
+    panels.append((f"{p}hdr", "visualization", 0, 0, 48, 8))
+
+    # Service health tiles: 3 tiles per service (throughput, latency, error rate)
+    # 7 services x 3 = 21 tiles, lay out in rows of 7 (one per service)
+    row_y = 8
+    for i, (svc_id, label, q) in enumerate(services):
+        sid = svc_id.replace("-", "")[:12]
+        col = i * 6 + (i // 4) * 6  # wrap after 4
+        if i < 4:
+            panels.append((f"{p}{sid}-tp",  "lens", i * 12,     row_y,     4, 6))
+            panels.append((f"{p}{sid}-lat", "lens", i * 12 + 4, row_y,     4, 6))
+            panels.append((f"{p}{sid}-err", "lens", i * 12 + 8, row_y,     4, 6))
+        else:
+            panels.append((f"{p}{sid}-tp",  "lens", (i - 4) * 16,     row_y + 6,  5, 6))
+            panels.append((f"{p}{sid}-lat", "lens", (i - 4) * 16 + 5, row_y + 6,  5, 6))
+            panels.append((f"{p}{sid}-err", "lens", (i - 4) * 16 + 10,row_y + 6,  6, 6))
+
+    # Time series charts
+    ts_y = row_y + 12
+    panels.append((f"{p}mule-flow-ts", "lens", 0,  ts_y,     48, 12))
+    panels.append((f"{p}err-ts",       "lens", 0,  ts_y + 12, 24, 12))
+    panels.append((f"{p}lat-ts",       "lens", 24, ts_y + 12, 24, 12))
+
+    # Top transactions tables (7 services, 2 per row)
+    tbl_y = ts_y + 24
+    for i, (svc_id, label, q) in enumerate(services):
+        sid = svc_id.replace("-", "")[:12]
+        row = i // 2
+        col = (i % 2) * 24
+        panels.append((f"{p}{sid}-top", "lens", col, tbl_y + row * 14, 24, 14))
+
+    print("  Creating dashboard...")
+    dashboard(c, "fnb-dashboard-health",
+        "[FNB] Service Health & Top Transactions",
+        "High-level operational dashboard: health KPIs for every service, error rates, latency trends, and top transactions by performance.",
+        panels)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Create FNB demo dashboards in Kibana")
     parser.add_argument("--kibana-url", default=os.getenv("KIBANA_URL"))
@@ -1271,6 +1381,7 @@ def main():
         ("Notification Service", build_d13),
         ("RUM — End-User Experience", build_d14),
         ("Customer & Business Intelligence", build_d15),
+        ("Service Health & Top Transactions", build_d16),
     ], 1):
         print(f"\n{i+1}. Building: {name}")
         fn(c)
@@ -1300,6 +1411,7 @@ def main():
         ("fnb-dashboard-notification",      "[Phase 3] Notification"),
         ("fnb-dashboard-rum",               "[Phase 3] RUM — End-User Experience"),
         ("fnb-dashboard-business",          "[Phase 3] Customer & Business Intelligence"),
+        ("fnb-dashboard-health",            "[Phase 3] Service Health & Top Transactions"),
     ]:
         print(f"  {name}")
         print(f"    {base}/app/dashboards#/view/{did}")
