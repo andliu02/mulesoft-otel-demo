@@ -628,3 +628,18 @@ service:
       receivers: [otlp]
       exporters: [otlp/elastic]
 ```
+
+---
+
+## AI-Assisted Investigation
+
+For more in-depth investigation and troubleshooting, utilize an AI assistant (such as Elastic AI Assistant or Claude) to:
+
+- **Analyze trace waterfalls** — Ask the AI to identify bottlenecks in distributed traces spanning MuleSoft flows and backend services
+- **Correlate signals** — Have the AI cross-reference traces, metrics, and logs to pinpoint root causes of latency spikes or errors
+- **Explain span attributes** — Ask what specific custom attributes (e.g., `payment.risk_score`, `mule.flow.name`) mean in context and how they relate to business outcomes
+- **Build custom queries** — Generate KQL or ES|QL queries to filter traces by specific transaction types, error codes, or latency thresholds
+- **Interpret metric trends** — Ask the AI to explain anomalies in histograms, counter rates, or gauge values and suggest remediation steps
+- **Debug instrumentation** — Get help troubleshooting missing spans, broken context propagation, or misconfigured exporters
+
+The AI can work with the raw telemetry data in Elastic to provide deeper analysis than dashboards alone — especially useful for complex distributed transaction flows across MuleSoft and downstream services.

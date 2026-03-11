@@ -18,7 +18,7 @@ Builds 16 dashboards + 8 alert rules via the Kibana API:
     15. Customer & Business Intelligence
 
 Usage:
-    python create_dashboards.py --kibana-url <URL> --api-key <KEY>
+    python create_dashboards.py --kibana-url <URL> --api-key <KEY> [--space <SPACE_ID>]
 
 Field naming (Elastic OTel passthrough mapping):
     Metric values:  mule.flow.executions      (short alias of metrics.mule.flow.executions)
@@ -75,6 +75,48 @@ class KibanaClient:
             self.errors += 1
             print(f"    ERROR {obj_type}/{obj_id}: {resp.status_code} {resp.text[:200]}")
         return resp
+
+    def ensure_space(self, space_id):
+        """Create the Kibana space if it doesn't exist."""
+        resp = self._request("GET", f"/api/spaces/space/{space_id}")
+        if resp.status_code == 200:
+            print(f"    Space '{space_id}' already exists")
+            return
+        body = {
+            "id": space_id,
+            "name": space_id,
+            "description": f"FNB Demo — {space_id}",
+        }
+        resp = self._request("POST", "/api/spaces/space", body)
+        if resp.status_code in (200, 201):
+            print(f"    Space '{space_id}' created")
+        else:
+            print(f"    ERROR creating space '{space_id}': {resp.status_code} {resp.text[:200]}")
+
+    def copy_to_space(self, space_id, dashboard_ids):
+        """Copy dashboards (with all referenced objects) from default space to target space."""
+        objects = [{"type": "dashboard", "id": did} for did in dashboard_ids]
+        body = {
+            "spaces": [space_id],
+            "objects": objects,
+            "includeReferences": True,
+            "overwrite": True,
+            "createNewCopies": False,
+            "compatibilityMode": True,
+        }
+        resp = self._request("POST", "/api/spaces/_copy_saved_objects", body)
+        if resp.status_code != 200:
+            print(f"    ERROR copying to space '{space_id}': {resp.status_code} {resp.text[:300]}")
+            return False
+        result = resp.json().get(space_id, {})
+        if result.get("success"):
+            print(f"    Copied {result['successCount']} objects to space '{space_id}'")
+            return True
+        else:
+            errors = result.get("errors", [])
+            for err in errors[:5]:
+                print(f"    ERROR: {err.get('type')}/{err.get('id')}: {err.get('error', {}).get('message', 'unknown')}")
+            return False
 
     def create_rule(self, rule_id, body):
         """Create or replace a Kibana alerting rule."""
@@ -1350,6 +1392,8 @@ def main():
     parser = argparse.ArgumentParser(description="Create FNB demo dashboards in Kibana")
     parser.add_argument("--kibana-url", default=os.getenv("KIBANA_URL"))
     parser.add_argument("--api-key", default=os.getenv("ELASTIC_API_KEY"))
+    parser.add_argument("--space", default=os.getenv("KIBANA_SPACE"),
+                        help="Kibana space ID (e.g. cust0014). Omit for default space.")
     args = parser.parse_args()
 
     if not args.kibana_url or not args.api_key:
@@ -1390,12 +1434,42 @@ def main():
     build_alerts(c)
 
     print(f"\n{'='*60}")
-    print(f"Created {c.created} objects, {c.errors} errors")
+    print(f"Created {c.created} objects, {c.errors} errors (default space)")
     print(f"{'='*60}")
 
+    dashboard_ids = [
+        "fnb-dashboard-mulesoft-metrics",
+        "fnb-dashboard-tracing",
+        "fnb-dashboard-trace-transactions",
+        "fnb-dashboard-mulesoft-svc",
+        "fnb-dashboard-payment-ops",
+        "fnb-dashboard-core-banking-db",
+        "fnb-dashboard-ops-center",
+        "fnb-dashboard-portal",
+        "fnb-dashboard-core-banking-svc",
+        "fnb-dashboard-fraud",
+        "fnb-dashboard-aml",
+        "fnb-dashboard-crm",
+        "fnb-dashboard-notification",
+        "fnb-dashboard-rum",
+        "fnb-dashboard-business",
+        "fnb-dashboard-health",
+    ]
+
+    # Copy to target space(s) if specified
+    spaces = []
+    if args.space:
+        spaces = [s.strip() for s in args.space.split(",") if s.strip()]
+    for space in spaces:
+        print(f"\n{'='*60}")
+        print(f"Copying dashboards to space: {space}")
+        print(f"{'='*60}")
+        c.ensure_space(space)
+        c.copy_to_space(space, dashboard_ids)
+
     base = args.kibana_url.rstrip("/")
-    print("\nDashboard URLs:")
-    for did, name in [
+    space_path = f"/s/{spaces[0]}" if spaces else ""
+    dashboard_labels = [
         ("fnb-dashboard-mulesoft-metrics",  "[Phase 1] MuleSoft Runtime Metrics (EDOT)"),
         ("fnb-dashboard-tracing",           "[Phase 2] Distributed Tracing — Service Flow"),
         ("fnb-dashboard-trace-transactions","[Phase 2] Key Transactions & Span Breakdown"),
@@ -1412,9 +1486,11 @@ def main():
         ("fnb-dashboard-rum",               "[Phase 3] RUM — End-User Experience"),
         ("fnb-dashboard-business",          "[Phase 3] Customer & Business Intelligence"),
         ("fnb-dashboard-health",            "[Phase 3] Service Health & Top Transactions"),
-    ]:
+    ]
+    print("\nDashboard URLs:")
+    for did, name in dashboard_labels:
         print(f"  {name}")
-        print(f"    {base}/app/dashboards#/view/{did}")
+        print(f"    {base}{space_path}/app/dashboards#/view/{did}")
 
     print()
     if c.errors > 0:
